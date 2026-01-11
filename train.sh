@@ -1,3 +1,15 @@
+p#!/bin/bash
+#SBATCH --job-name=lf_base                    # Job name
+#SBATCH --output=outputs/lf_base_%j.log        # Standard output log (%j = job ID)
+#SBATCH --error=outputs/lf_base_%j.err         # Standard error log
+#SBATCH --time=2-00:00:00                     # Time limit (dd-hh:mm:ss)
+#SBATCH --ntasks=2                            # Number of tasks (typically 1 for single-node jobs)
+#SBATCH --cpus-per-task=8                     # Number of CPUs per task
+#SBATCH --mem=48GB                            # Memory allocation
+#SBATCH --partition=ada                       # Partition (long/queue)
+#SBATCH --gres=gpu:ADA6000:2                  # GPU allocation (if needed, modify accordingly)
+#SBATCH --account=freerun
+# =============================================================
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
 source ~/miniconda3/etc/profile.d/conda.sh
