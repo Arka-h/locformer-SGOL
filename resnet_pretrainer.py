@@ -21,7 +21,6 @@ import util.misc as utils
 from dotenv import load_dotenv
 load_dotenv()
 
-PROJECT_HOME = Path(os.environ.get("PROJECT_HOME"))
 COCO_HOME = Path(os.environ.get("COCO_HOME"))
 PROJECT_HOME = Path(os.environ.get("PROJECT_HOME"))
 QUICKDRAW_PATH = PROJECT_HOME / "checkpoints/processed_quick_draw_paths_purified.pkl"

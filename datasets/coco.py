@@ -8,6 +8,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 from hashlib import new
 import json
 from pathlib import Path
+import pdb
 # from scipy import rand
 import torch
 import torch.utils.data
@@ -97,10 +98,13 @@ def make_coco_transforms_for_eval(image_set, args):
         raise ValueError(f'unknown {image_set}')
 
 class CocoDetectionQD(torchvision.datasets.CocoDetection):
-    def __init__(self, image_set, img_folder, ann_file, transforms, return_masks):
+    def __init__(self, image_set, img_folder, ann_file, root, transforms, return_masks):
         json_file = json.load(open(ann_file))
-        ROOT = '/home/rahul/coco/annotations'  # TODO: Refactor this
+        self.coco_home = Path(root)
+        ROOT = self.coco_home / 'annotations'  # TODO: Refactor this
         classes = json_file['categories']
+        # self.sketch_save_dir = Path('saved_images_local_5')
+        # self.sketch_save_dir.mkdir(parents=True, exist_ok=True)
         self.id2class = {}
         self.class2id = {}
 
@@ -136,9 +140,9 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         
         json_file['annotations'] = annotate
         json_file['images'] = images
-        json.dump(json_file, open(ROOT+'/'+'temp_json_file_'+image_set+'.json', 'w'))
-        temp_ann_file = os.path.join(ROOT, 'temp_json_file_'+image_set+'.json')
-        super(CocoDetectionQD, self).__init__(img_folder, temp_ann_file)
+        json.dump(json_file, open(ROOT/ f'temp_json_file_{image_set}.json', 'w'))
+        temp_ann_file = ROOT / f'temp_json_file_{image_set}.json'
+        super().__init__(img_folder, temp_ann_file)
         self.image_set = image_set
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
@@ -196,15 +200,17 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
 
         sketches = random.choices(self.class2quick[selected_cat], k=5)
         sketch_list = []
-        i = 0
+        # i = 0
         for sketch in sketches:
-
+            sketch = self._resolve_path(sketch)
+            print(sketch)
+            exit()
             sketch = pickle.load(open(sketch, 'rb'))
             key = list(sketch.keys())[0]
             sketch = convert_to_np_raw(sketch[key])
-            if i == 2:
-                sketch.save("saved_images_local_5/query_sketch"+str(idx)+".png")
-            i += 1
+            # if i == 2:
+            #     sketch.save(str(self.sketch_save_dir / f"query_sketch{idx}.png"))
+            # i += 1
             sketch = 255 - np.asarray(sketch)
             sketch = Image.fromarray(sketch)
             sketch = self.transforms_sketch(sketch)
@@ -220,13 +226,18 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
             new_target['boxes'] = old_boxes
 
         return img, new_target, sketch_list
-
+    def _resolve_path(self, sketch_path):
+        sketch_path = Path(sketch_path)
+        if sketch_path.is_absolute():
+            return Path(*self.coco_home.parts, *sketch_path.parts[4:])
+        return sketch_path
 
 class CocoDetectionSketchy(torchvision.datasets.CocoDetection):
-    def __init__(self, image_set, img_folder, ann_file, transforms, return_masks):
+    def __init__(self, image_set, img_folder, ann_file, root, transforms, return_masks):
         # super(CocoDetection, self).__init__(img_folder, ann_file)
         json_file = json.load(open(ann_file))
-        ROOT = '/home/rahul/coco/annotations' # TODO: Refactor this
+        self.coco_home = Path(root)
+        ROOT = self.coco_home / 'annotations' # TODO: Refactor this
         classes = json_file['categories']
         sketchy_path = "/home/rahul/coco/sketch_data/sketchy_dataset.pkl" #  # TODO: Refactor this
         sketchy_path = pickle.load(open(sketchy_path, 'rb'))
@@ -339,7 +350,11 @@ class CocoDetectionSketchy(torchvision.datasets.CocoDetection):
             new_target['boxes'] = old_boxes        
 
         return img, new_target, sketch_list
-
+    def _resolve_path(self, sketch_path):
+        sketch_path = Path(sketch_path)
+        if sketch_path.is_absolute():
+            return Path(*self.coco_home.parts, *sketch_path.parts[4:])
+        return sketch_path
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
     for polygons in segmentations:
@@ -468,7 +483,7 @@ def build(image_set, args):
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetectionQD(image_set, img_folder, ann_file,
+    dataset = CocoDetectionQD(image_set, img_folder, ann_file, root,
                             transforms=make_coco_transforms(image_set, args),
                             return_masks=True)
     return dataset

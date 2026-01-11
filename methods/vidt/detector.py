@@ -295,6 +295,14 @@ class Detector(nn.Module):
         nn.init.xavier_uniform_(self.query_pos_proj[0].weight, gain=1)
         nn.init.constant_(self.query_pos_proj[0].bias, 0)
 
+        # trans definition
+        # self.trans = torch.nn.Sequential(
+        #                                 torch.nn.ReLU(),
+        #                                 torch.nn.Linear(
+        #                                     in_features=hidden_dim,
+        #                                     out_features=hidden_dim
+        #                                 )
+        #                             )
         self.sketch_embedding = torchvision.models.resnet50(pretrained=True)
         if has_sketch_emb_pt:
             state_dict = torch.load("/path/to/sketch-encoder/best_model.pt") # TODO: What's here?
@@ -338,7 +346,7 @@ class Detector(nn.Module):
         # set up all required nn.Module for additional techniques
         if with_box_refine:
             self.class_embed_v2 = _get_clones(self.class_embed_v2, num_pred)
-            self.trans = _get_clones(self.trans, num_pred)
+            # self.trans = _get_clones(self.trans, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
@@ -469,7 +477,7 @@ class Detector(nn.Module):
 
             
             
-            sk = self.trans[lvl](glob_sketch)
+            sk = glob_sketch #self.trans[lvl](glob_sketch)
                         
             # a = torch.cat([sk, hs[lvl]], dim=-1)
             a = torch.cat([sk, a], dim=-1)

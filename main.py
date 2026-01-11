@@ -68,6 +68,15 @@ def main(args):
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
+    teacher_model = None
+    if args.distil_model is not None:
+        teacher_model = build_distil_model(args)
+        teacher_model.to(device)
+        if args.distil_model_path:
+            checkpoint = torch.load(args.distil_model_path, map_location='cpu')
+            teacher_state = checkpoint.get('model', checkpoint)
+            teacher_model.load_state_dict(teacher_state, strict=False)
+
 
     # parallel model setup
     model_without_ddp = model
@@ -284,5 +293,4 @@ if __name__ == '__main__':
         print('log', args.output_dir)
 
     main(args)
-
 
