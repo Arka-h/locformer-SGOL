@@ -1,0 +1,9 @@
+*.pth
+__pycache__/
+checkpoints/
+build/
+dist/
+*.egg-info
+wandb/
+outputs/
+.env

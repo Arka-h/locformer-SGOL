@@ -18,10 +18,7 @@ from torch import Tensor
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if float(torchvision.__version__[:3]) < 0.7:
-    from torchvision.ops import _new_empty_tensor
-    from torchvision.ops.misc import _output_size
-
+import torch.nn.functional as F
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -464,23 +461,35 @@ def accuracy(output, target, topk=(1,)):
 
 
 def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corners=None):
-    # type: (Tensor, Optional[List[int]], Optional[float], str, Optional[bool]) -> Tensor
     """
-    Equivalent to nn.functional.interpolate, but with support for empty batch sizes.
-    This will eventually be supported natively by PyTorch, and this
-    class can go away.
+    Like torch.nn.functional.interpolate, but safe for empty tensors.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(
-                input, size, scale_factor, mode, align_corners
-            )
+    # If empty, return an empty tensor with the expected output spatial shape.
+    if input.numel() == 0:
+        # infer output H, W
+        if size is not None:
+            out_h, out_w = size
+        else:
+            # scale_factor can be float or tuple/list
+            sf = scale_factor
+            if isinstance(sf, (tuple, list)):
+                sf_h, sf_w = sf
+            else:
+                sf_h = sf_w = sf
+            out_h = int(input.shape[-2] * sf_h)
+            out_w = int(input.shape[-1] * sf_w)
 
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        return _new_empty_tensor(input, output_shape)
-    else:
-        return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+        out_shape = list(input.shape[:-2]) + [out_h, out_w]
+        return input.new_empty(out_shape)
+
+    # Non-empty: just use PyTorch's interpolate
+    return F.interpolate(
+        input,
+        size=size,
+        scale_factor=scale_factor,
+        mode=mode,
+        align_corners=align_corners,
+    )
 
 def inverse_sigmoid(x, eps=1e-5):
     x = x.clamp(min=0, max=1)

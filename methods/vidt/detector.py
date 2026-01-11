@@ -207,7 +207,7 @@ class Detector(nn.Module):
                  # The three techniques were not used in ViDT paper.
                  # After submitting our paper, we saw the ViDT performance could be further enhanced with them.
                  cross_scale_fusion=None, iou_aware=False, token_label=False,
-                 distil=False):
+                 distil=False, has_sketch_emb_pt=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -296,8 +296,8 @@ class Detector(nn.Module):
         nn.init.constant_(self.query_pos_proj[0].bias, 0)
 
         self.sketch_embedding = torchvision.models.resnet50(pretrained=True)
-        if True:
-            state_dict = torch.load("/path/to/sketch-encoder/best_model.pt")
+        if has_sketch_emb_pt:
+            state_dict = torch.load("/path/to/sketch-encoder/best_model.pt") # TODO: What's here?
             new_state_dict = OrderedDict()
             for k, v in state_dict.items():
                 name = k[13:] # remove `module.`

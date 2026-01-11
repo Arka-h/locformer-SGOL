@@ -1,0 +1,12 @@
+scipy
+pycocotools
+cython
+onnx
+onnxruntime
+timm
+einops
+tqdm
+opencv-python
+ndjson
+wandb
+transformers

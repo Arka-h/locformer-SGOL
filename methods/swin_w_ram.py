@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+from pathlib import Path
 from requests import patch
 import torch
 import torch.nn as nn
@@ -1286,27 +1287,44 @@ def swin_nano(pretrained=None, **kwargs):
     return model, 384
 
 
-def swin_tiny(pretrained=None, **kwargs):
-    model = SwinTransformer(pretrain_img_size=[224, 224], embed_dim=96, depths=[2, 2, 6, 2],
-                            num_heads=[3, 6, 12, 24], window_size=7, drop_path_rate=0.2, **kwargs)
-
+def swin_tiny(pretrained=None, *, weights_key="model", strict=False, map_location="cpu", **kwargs):
+    IMAGENET_URL = "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth"
+    model = SwinTransformer(pretrain_img_size=[224, 224], 
+                            embed_dim=96, 
+                            depths=[2, 2, 6, 2],
+                            num_heads=[3, 6, 12, 24], 
+                            window_size=7, 
+                            drop_path_rate=0.2, 
+                            **kwargs)
+    
+    out_dim = 768 # embed_dim * 8 for Swin-T
+    
     if pretrained is None or pretrained == 'none':
-        return model, 768
+        return model, out_dim
 
-    if pretrained is not None:
-        if pretrained == 'imagenet':
-            torch.hub._download_url_to_file(
-                url="https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth",
-                dst="checkpoint.pth"
-            )
-            checkpoint = torch.load("checkpoint.pth", map_location="cpu")
-            model.load_state_dict(checkpoint["model"], strict=False)
-            print('Load the backbone pretrained on ImageNet 1K')
-        else:
-            checkpoint = torch.load(pretrained, map_location="cpu")
-            model.load_state_dict(checkpoint["model"], strict=False)
-            print('Load the backbone in the given path')
-    return model, 768
+    if pretrained == 'imagenet':
+        ckpt = torch.hub.load_state_dict_from_url(
+            IMAGENET_URL,
+            map_location=map_location,
+            check_hash=False,   # set True only if you have a known hash
+            progress=True
+        )
+        print("Load the backbone pretrained on ImageNet 1K")
+    else:
+        ckpt_path = Path(pretrained)
+        ckpt = torch.load(ckpt_path, map_location=map_location)
+        print("Load the backbone from the given path")
+        
+    # Many repos store {'model': state_dict}, some store state_dict directly
+    state_dict = ckpt.get(weights_key, ckpt) if isinstance(ckpt, dict) else ckpt
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=strict)
+    if missing:
+        print(f"[swin_tiny] Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"[swin_tiny] Unexpected keys: {len(unexpected)}")
+    
+    return model, out_dim
 
 
 def swin_small(pretrained=None, **kwargs):

@@ -8,7 +8,7 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 from hashlib import new
 import json
 from pathlib import Path
-from scipy import rand
+# from scipy import rand
 import torch
 import torch.utils.data
 import torchvision
@@ -38,7 +38,7 @@ def box_cxcywh_to_xyxy(x):
 def convert_to_np_raw(drawing, width=224, height=224):
     img = np.zeros((width, height))
     pil_img = convert_to_PIL(drawing)
-    pil_img.thumbnail((width, height), Image.ANTIALIAS)
+    pil_img.thumbnail((width, height), getattr(Image, 'Resampling', Image).LANCZOS) # changed from old ANTIALIAS
     pil_img = pil_img.convert('RGB')
     pixels = pil_img.load()
 
@@ -99,7 +99,7 @@ def make_coco_transforms_for_eval(image_set, args):
 class CocoDetectionQD(torchvision.datasets.CocoDetection):
     def __init__(self, image_set, img_folder, ann_file, transforms, return_masks):
         json_file = json.load(open(ann_file))
-        ROOT = '/path/to/coco/annotations'
+        ROOT = '/home/rahul/coco/annotations'  # TODO: Refactor this
         classes = json_file['categories']
         self.id2class = {}
         self.class2id = {}
@@ -148,7 +148,7 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
             torchvision.transforms.ToTensor(),
             normalize_transform()
             ])
-        _quickdraw_path = "/path/to/processed_quick_draw_paths_purified.pkl"
+        _quickdraw_path = "/home/rahul/locformer-SGOL/checkpoints/processed_quick_draw_paths_purified.pkl"  # TODO: Refactor this
         _quickdraw_path = pickle.load(open(_quickdraw_path, 'rb'))
 
         print("Loading Quick,Draw! ...")
@@ -165,7 +165,7 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         self.image_set = image_set
 
     def __getitem__(self, idx):
-        img, target = super(CocoDetectionQD, self).__getitem__(idx)
+        img, target = super().__getitem__(idx)
         if not self.image_set == 'train':
             random.seed(14)
         else:
@@ -226,9 +226,9 @@ class CocoDetectionSketchy(torchvision.datasets.CocoDetection):
     def __init__(self, image_set, img_folder, ann_file, transforms, return_masks):
         # super(CocoDetection, self).__init__(img_folder, ann_file)
         json_file = json.load(open(ann_file))
-        ROOT = '/path/to/coco/annotations'
+        ROOT = '/home/rahul/coco/annotations' # TODO: Refactor this
         classes = json_file['categories']
-        sketchy_path = "/path/to/sketchy_dataset.pkl"
+        sketchy_path = "/home/rahul/coco/sketch_data/sketchy_dataset.pkl" #  # TODO: Refactor this
         sketchy_path = pickle.load(open(sketchy_path, 'rb'))
         self.id2class = {}
         self.class2id = {}
@@ -284,7 +284,7 @@ class CocoDetectionSketchy(torchvision.datasets.CocoDetection):
         else:
             self.class2quick = sketchy_path['valid']
         
-        self.sketchy_root = "/path/to/sketchy/images"
+        self.sketchy_root = "/home/rahul/coco/sketch_data/images" # TODO: Refactor this
         self.image_set = image_set
     
 
@@ -468,7 +468,9 @@ def build(image_set, args):
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetection(image_set, img_folder, ann_file,
+    dataset = CocoDetectionQD(image_set, img_folder, ann_file,
                             transforms=make_coco_transforms(image_set, args),
                             return_masks=True)
     return dataset
+
+# TODO: Build a testing code on `__main__` to verify the dataset loading properly

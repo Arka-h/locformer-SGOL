@@ -10,6 +10,7 @@ import os
 import glob
 
 import torch
+import os
 
 from torch.utils.cpp_extension import CUDA_HOME
 from torch.utils.cpp_extension import CppExtension
@@ -32,6 +33,16 @@ def get_extensions():
     extension = CppExtension
     extra_compile_args = {"cxx": []}
     define_macros = []
+    
+    # Detect compute capability
+    major, minor = torch.cuda.get_device_capability()
+    compute_capability = f"{major}{minor}"
+    
+    # Generate gencode flags for nvcc
+    gencode_flags = [
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}"
+    ]
 
     if torch.cuda.is_available() and CUDA_HOME is not None:
         extension = CUDAExtension
@@ -41,10 +52,10 @@ def get_extensions():
             "-DCUDA_HAS_FP16=1",
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
-            "-D__CUDA_NO_HALF2_OPERATORS__",
-        ]
+            "-D__CUDA_NO_HALF2_OPERATORS__"
+        ] + gencode_flags
     else:
-        raise NotImplementedError('Cuda is not availabel')
+        raise NotImplementedError('Cuda is not available')
 
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir]
@@ -58,6 +69,18 @@ def get_extensions():
         )
     ]
     return ext_modules
+
+version = torch.__version__.split('.')
+torch_major = int(version[0])
+torch_minor = int(version[1])
+
+# Create a header file for the current version of PyTorch
+version_header = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                             'src/cuda/torch_version.h')
+with open(version_header, 'w') as f:
+    f.write("#pragma once\n")
+    f.write(f"#define TORCH_MAJOR_VERSION {torch_major}\n")
+    f.write(f"#define TORCH_MINOR_VERSION {torch_minor}\n")
 
 setup(
     name="MultiScaleDeformableAttention",

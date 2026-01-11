@@ -5,8 +5,5 @@
 # ------------------------------------------------------------------------------------------------
 # Modified from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/tree/pytorch_1.0.0
 # ------------------------------------------------------------------------------------------------
-# Copyright (c) 2021 NAVER AI Lab
-# Additionally written by Hwanjun Song
-# --------------------------------------------------------
 
-from .ms_deform_attn import MSDeformAttn, DetachableAttn
+from .ms_deform_attn import MSDeformAttn

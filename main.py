@@ -26,7 +26,7 @@ from arguments import get_args_parser
 import argparse
 import wandb
 
-wandb.init(project="my-test-project", entity="vaporymaple")
+wandb.init(project="my-test-project", entity="aurkohaldi")
 
 def build_distil_model(args):
     """ build a teacher model """
