@@ -203,8 +203,6 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         # i = 0
         for sketch in sketches:
             sketch = self._resolve_path(sketch)
-            print(sketch)
-            exit()
             sketch = pickle.load(open(sketch, 'rb'))
             key = list(sketch.keys())[0]
             sketch = convert_to_np_raw(sketch[key])

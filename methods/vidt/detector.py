@@ -397,14 +397,23 @@ class Detector(nn.Module):
         x = samples[0]
         mask = samples[1]
 
+        bs = sketches.shape[0]
+        if sketches.dim() == 5:
+            num_sketches = sketches.shape[1]
+            sketches = sketches.view(bs * num_sketches, sketches.shape[2], sketches.shape[3], sketches.shape[4])
+        elif sketches.dim() == 4:
+            num_sketches = 1
+        else:
+            raise ValueError(f"Expected sketches tensor to be 4D or 5D, got {sketches.dim()}D")
+
         sketches = self.sketch_embedding(sketches)
-        
-        sketches = sketches.view(sketches.shape[0],2048,7,7)
+        _, c, h, w = sketches.shape
+        sketches = sketches.view(bs, num_sketches, c, h, w).mean(dim=1)
         sketches = self.gp_norm(sketches)
-        #  project sketches to the same dimension as x
+        # project sketches to the same dimension as x
         sketches = self.sketch_proj(sketches)
 
-        sketches = sketches.view(bs,256,7,7)
+        bs = sketches.shape[0]
 
 
         # return multi-scale [PATCH] tokens along with final [DET] tokens and their pos encodings
