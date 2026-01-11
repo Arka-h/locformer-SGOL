@@ -1,7 +1,7 @@
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate locformer
+conda activate clip_ddetr
 
 # Job execution commands
 . ./.env

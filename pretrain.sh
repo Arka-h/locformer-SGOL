@@ -1,7 +1,7 @@
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate locformer
+conda activate clip_ddetr
 
 # Job execution commands
 . ./.env
@@ -30,6 +30,7 @@ python -u -m torch.distributed.run \
     --nproc_per_node=$SLURM_GPUS_ON_NODE \
     --master_port $MASTER_PORT \
     resnet_pretrainer.py \
+    --batch-size 2987 \
     --run-name "r50-sgd" \
     --wandb-project "resnet50-quickdraw-pt" \
     --ddp

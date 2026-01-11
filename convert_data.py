@@ -47,7 +47,7 @@ def process_one(args):
     # args = (i, pkl_path, label, size)
     i, pkl_path, label, size = args
     png_bytes = pkl_to_png_bytes(pkl_path, size=size)
-    return i, png_bytes, int(label)
+    return i, png_bytes, label
 
 def add_bytes_to_tar(tar: tarfile.TarFile, arcname: str, data: bytes):
     info = tarfile.TarInfo(name=arcname)
@@ -103,7 +103,13 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    samples = json.load(open(args.index_json, "r"))
+    if not os.path.exists(args.index_json):
+        print(f"Generating index json for {args.prefix}...")
+        samples = index_generator(args.prefix)
+        with open(args.index_json, "w") as f:
+            json.dump(samples, f)
+    else:
+        samples = json.load(open(args.index_json, "r"))
     n = len(samples)
     print(f"Loaded {n} samples")
     
@@ -135,11 +141,6 @@ def main():
     if start_i >= n:
         print("All shards already processed. Nothing to do.", flush=True)
         return
-    
-    # We iterate shard-by-shard to keep writes sequential and resume-friendly.
-    index = index_generator(args.prefix)
-    with open(COCO_HOME / f"processed_quickdraw/{args.prefix}_index.json", "w") as f:
-        json.dump(index, f)
 
     ctx = mp.get_context("spawn") # safer with PIL on clusters
     pool = ctx.Pool(processes=args.num_workers, initializer=worker_init)
