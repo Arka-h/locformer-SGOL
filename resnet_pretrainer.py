@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import pickle as pkl
 from typing import Optional
-
+import lmdb, struct, io
 import numpy as np
 from PIL import Image
 import torch
@@ -69,7 +69,7 @@ class JobConfig:
 
 
 CHECKPOINT_FILENAME = "latest.pth"
-
+META_LEN_KEY = b"__len__"
 
 def _get_model_state(model):
     return model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -131,6 +131,65 @@ def load_checkpoint_if_available(model, optimizer, scaler, checkpoint_dir, resum
         )
     return next_epoch, global_step
 
+def decode_record(buf: bytes):
+    (lbl_len,) = struct.unpack("<H", buf[:2])
+    lbl = buf[2:2+lbl_len]
+    png = buf[2+lbl_len:]
+    return lbl, png
+
+class QuickDrawLMDB(Dataset):
+    def __init__(self, lmdb_path: str, transform=None, class_to_idx=None, readonly=True):
+        self.lmdb_path = lmdb_path
+        self.transform = transform
+        self.class_to_idx = class_to_idx
+        self.readonly = readonly
+        self._env = None
+        self._length = None
+
+    def _open(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self.lmdb_path,
+                subdir=False,
+                readonly=self.readonly,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_readers=2048,
+            )
+        if self._length is None:
+            with self._env.begin(write=False) as txn:
+                n = txn.get(META_LEN_KEY)
+                if n is None:
+                    raise RuntimeError("LMDB missing __len__")
+                self._length = int(n.decode("utf-8"))
+        return self._env
+
+    def __len__(self):
+        self._open()
+        return self._length
+
+    def __getitem__(self, idx):
+        env = self._open()
+        key = f"{idx:09d}".encode("utf-8")  # matches your tar keys
+        with env.begin(write=False) as txn:
+            buf = txn.get(key)
+        if buf is None:
+            raise IndexError(idx)
+
+        lbl_b, png_b = decode_record(buf)
+        lbl_s = lbl_b.decode("utf-8").strip()
+
+        img = Image.open(io.BytesIO(png_b)).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.class_to_idx is not None:
+            y = self.class_to_idx[lbl_s]
+        else:
+            y = lbl_s
+
+        return img, y
 
 class QuickDrawSketchDataset(Dataset):
     def __init__(self, sketch_paths, class_to_idx, transform, coco_home):
@@ -180,7 +239,7 @@ def build_class_mapping(sketch_paths):
 
 def build_dataset(sketch_paths, class_to_idx):
     transforms_sketch = ResNet50_Weights.IMAGENET1K_V1.transforms()
-    return QuickDrawSketchDataset(
+    return QuickDrawLMDB(
         sketch_paths=sketch_paths,
         class_to_idx=class_to_idx,
         transform=transforms_sketch,
@@ -713,5 +772,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# """
 
 # """
