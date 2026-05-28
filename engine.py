@@ -20,7 +20,7 @@ from datasets import  get_coco_api_from_dataset
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int,lr_scheduler,  max_norm: float = 0,
+                    device: torch.device, epoch: int, max_norm: float = 0,
                     n_iter_to_acc: int = 1, print_freq: int = 100):
     """
     Training one epoch
@@ -54,10 +54,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # iterate one epoch
     for samples, targets, sketches in metric_logger.log_every(data_loader, print_freq, header):
 
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        sketches = torch.cat([sketch.unsqueeze(0) for sketch in sketches], dim=0)
-        sketches = sketches.to(device)
+        samples  = samples.to(device)
+        targets  = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        sketches = torch.stack(sketches, dim=0).to(device)
         
         outputs = model([samples.tensors, samples.mask], sketches)
 
@@ -94,12 +93,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             optimizer.step()
             optimizer.zero_grad()
         # lr_scheduler.step()
-        
+
+        batch_idx += 1
+
         # save logs per iteration
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        
+
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -142,14 +143,16 @@ def train_one_epoch_with_teacher(model: torch.nn.Module, teacher_model: torch.nn
 
     batch_idx = 0
     # iterate one epoch
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets, sketches in metric_logger.log_every(data_loader, print_freq, header):
 
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        samples  = samples.to(device)
+        targets  = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        sketches = torch.stack(sketches, dim=0).to(device)
 
         # inference
-        outputs = model(samples)
-        teacher_outputs = teacher_model(samples)
+        outputs = model([samples.tensors, samples.mask], sketches)
+        with torch.no_grad():
+            teacher_outputs = teacher_model([samples.tensors, samples.mask], sketches)
 
         # collect distillation token for matching loss
         distil_tokens = (outputs['distil_tokens'], teacher_outputs['distil_tokens'])
@@ -203,7 +206,7 @@ def inverse_normalize(tensor, mean, std):
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, plot=False):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device):
     """
     Training one epoch
 
@@ -240,9 +243,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, plo
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        sketches = torch.cat([sketch.unsqueeze(0) for sketch in sketches], dim=0)
-
-        sketches = sketches.to(device)
+        sketches = torch.stack(sketches, dim=0).to(device)
         # inference
 
         outputs = model([samples.tensors, samples.mask], sketches)

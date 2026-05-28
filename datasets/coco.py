@@ -1,358 +1,377 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
-COCO dataset which returns image_id for evaluation.
+COCO detection dataset paired with QuickDraw sketch queries.
 
-Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
+Sketch loading follows the mmap-backed approach from SLIP/datasets.py
+(ptr + strokes .npy files, rasterised on-the-fly with rasterize_stroke3).
 """
-# from __future__ import annotations
 from hashlib import new
 import json
 from pathlib import Path
-import pdb
-# from scipy import rand
 import torch
 import torch.utils.data
 import torchvision
 
 from pycocotools import mask as coco_mask
 import datasets.transforms as T
-# from tqdm import tqdm
 import pickle
 from collections import defaultdict
 import random
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 import time
-
-
-import ndjson
 import os
 
 
-def box_cxcywh_to_xyxy(x):
-    x_c, y_c, w, h = x.unbind(-1)
-    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-         (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=-1)
+# ---------------------------------------------------------------------------
+# Stroke rasteriser (mirrors SLIP/datasets.py rasterize_stroke3)
+# ---------------------------------------------------------------------------
+def rasterize_stroke3(strokes, size=224, line_width=2, padding=10):
+    """
+    Convert stroke-3 format (T, 3) int16 to a white-background PIL RGB image.
+
+    pen_state=0: pen down — continue current stroke
+    pen_state=1: pen up   — end this stroke, next point starts a fresh one
+    """
+    abs_coords = np.cumsum(strokes[:, :2], axis=0).astype(float)
+    pen_states  = strokes[:, 2]
+
+    x, y = abs_coords[:, 0], abs_coords[:, 1]
+    x_range = x.max() - x.min() or 1
+    y_range = y.max() - y.min() or 1
+    scale = (size - 2 * padding) / max(x_range, y_range)
+    x = ((x - x.min()) * scale + padding).astype(int)
+    y = ((y - y.min()) * scale + padding).astype(int)
+
+    img  = Image.new('RGB', (size, size), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    stroke_points = []
+    for i in range(len(strokes)):
+        stroke_points.append((int(x[i]), int(y[i])))
+        if pen_states[i] == 1:
+            if len(stroke_points) >= 2:
+                draw.line(stroke_points, fill=(0, 0, 0), width=line_width)
+            stroke_points = []
+
+    if len(stroke_points) >= 2:
+        draw.line(stroke_points, fill=(0, 0, 0), width=line_width)
+
+    return img
 
 
-def convert_to_np_raw(drawing, width=224, height=224):
-    img = np.zeros((width, height))
-    pil_img = convert_to_PIL(drawing)
-    pil_img.thumbnail((width, height), getattr(Image, 'Resampling', Image).LANCZOS) # changed from old ANTIALIAS
-    pil_img = pil_img.convert('RGB')
-    pixels = pil_img.load()
-
-    for i in range(0, width):
-        for j in range(0, height):
-            img[i,j] = 1- pixels[j,i][0]/255.0
-    # return img
-    return pil_img
-
-def convert_to_PIL(drawing, width=224, height=224): # 256 before
+# ---------------------------------------------------------------------------
+# Legacy vector-drawing helpers (kept for convert_data.py compatibility)
+# ---------------------------------------------------------------------------
+def convert_to_PIL(drawing, width=224, height=224):
     pil_img = Image.new('RGB', (width, height), 'white')
-    pixels = pil_img.load()
     draw = ImageDraw.Draw(pil_img)
-    for x,y in drawing:
+    for x, y in drawing:
         for i in range(1, len(x)):
             draw.line((x[i-1], y[i-1], x[i], y[i]), fill=0)
     return pil_img
 
+
 def normalize_transform():
-    return torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    return torchvision.transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
 
 
-def make_coco_transforms_for_eval(image_set, args):
-    
-        normalize = T.Compose([
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-    
-        scales = [480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800]
-    
-        print("Resolution: shortest at most", max(scales))
-        if image_set == 'train':
-            return T.Compose([
-                T.RandomHorizontalFlip(),
-                T.RandomSelect(
-                    T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
-                    T.Compose([
-                        T.RandomResize([400, 500, 600]),
-                        T.RandomSizeCrop(384, 600),
-                        T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
-                    ])
-                ),
-                normalize,
-            ])
-    
-        print(args.eval_size)
-    
-        if image_set == 'val':
-            return T.Compose([
-                T.RandomResize([args.eval_size], max_size=args.eval_size * 1333 // 800),
-                normalize,
-            ])
-    
-        raise ValueError(f'unknown {image_set}')
+# ---------------------------------------------------------------------------
+# QuickDraw mmap index — mirrors SLIP's QuickDraw base class
+# ---------------------------------------------------------------------------
+class QuickDrawIndex:
+    """
+    Mmap-backed per-class index over QuickDraw SketchRNN npy files.
 
+    Mirrors SLIP's QuickDraw base class.  Classes are loaded in parallel via
+    ThreadPoolExecutor (avoids 10-20 min NFS startup delays).  Per-class
+    sample index arrays are numpy int32 (not Python lists) so they are
+    shared read-only across DataLoader workers after fork without CoW copies.
+
+    Expected files under `root`:
+        {class_name}.{split}.ptr.npy      — shape (N+1,) int64 byte offsets
+        {class_name}.{split}.strokes.npy  — shape (total_strokes, 3) int16
+
+    `split` is 'train', 'valid', or 'test'.
+    """
+
+    def __init__(self, root: str, class_names: list, split: str = 'train'):
+        assert split in ('train', 'valid', 'test'), \
+            f"split must be 'train', 'valid', or 'test', got {split!r}"
+        self.root        = root
+        self.split       = split
+        self.class_names = list(class_names)
+        self.class_to_idx = {name: i for i, name in enumerate(self.class_names)}
+        # class_name -> (ptr ndarray, strokes mmap)
+        self._mmap_cache: dict = {}
+        # class_name -> np.arange(n, dtype=np.int32)  — fork-safe, no CoW
+        self.class2indices: dict = {}
+
+        def _load_one(class_name):
+            ptr_path     = os.path.join(root, f'{class_name}.{split}.ptr.npy')
+            strokes_path = os.path.join(root, f'{class_name}.{split}.strokes.npy')
+            if not (os.path.exists(ptr_path) and os.path.exists(strokes_path)):
+                return class_name, None, None
+            ptr     = np.load(ptr_path)
+            strokes = np.load(strokes_path, mmap_mode='r')
+            return class_name, ptr, strokes
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            results = list(ex.map(_load_one, self.class_names))
+
+        missing = []
+        for class_name, ptr, strokes in results:
+            if ptr is None:
+                missing.append(class_name)
+                continue
+            self._mmap_cache[class_name]   = (ptr, strokes)
+            self.class2indices[class_name] = np.arange(len(ptr) - 1, dtype=np.int32)
+
+        if missing:
+            print(f'[QuickDrawIndex] Warning: npy files not found for '
+                  f'{len(missing)} class(es): {missing[:5]}')
+
+    def has_class(self, class_name: str) -> bool:
+        return class_name in self._mmap_cache
+
+    def sample_pil(self, class_name: str, k: int = 5) -> list:
+        """Return k rasterised PIL images sampled randomly from `class_name`."""
+        ptr, strokes = self._mmap_cache[class_name]
+        indices = np.random.choice(self.class2indices[class_name], size=k, replace=True)
+        return [rasterize_stroke3(strokes[ptr[i]: ptr[i + 1]]) for i in indices]
+
+
+# ---------------------------------------------------------------------------
+# Dataset: COCO detection + QuickDraw sketch queries
+# ---------------------------------------------------------------------------
 class CocoDetectionQD(torchvision.datasets.CocoDetection):
-    def __init__(self, image_set, img_folder, ann_file, root, transforms, return_masks):
+    """
+    COCO detection dataset where each sample is paired with k QuickDraw
+    sketches of the *query* object category, loaded via SLIP-style mmap npy
+    files (rasterised on-the-fly with rasterize_stroke3).
+
+    Returns: (image_tensor, target_dict, sketch_tensor)
+        sketch_tensor: float32 [k, 3, 224, 224], normalised
+    """
+    # UNSEEN_CATS follows Locformer's i%4==0 of their category ordering, not clip_ddetr's. 
+    # !Do not change to match clip_ddetr without also re-pretraining
+    # Categories visible during training (matches original subset)
+    ALL_CATEGORIES = [
+        'elephant', 'bear', 'cat', 'zebra', 'bus', 'horse', 'giraffe',
+        'airplane', 'bed', 'dog', 'scissors', 'train', 'sandwich', 'pizza',
+        'cow', 'broccoli', 'umbrella', 'sheep', 'bird', 'stop sign',
+        'toothbrush', 'bicycle', 'hot dog', 'laptop', 'toaster', 'microwave',
+        'banana', 'baseball bat', 'donut', 'couch', 'keyboard', 'cake',
+        'oven', 'carrot', 'bench', 'suitcase', 'fire hydrant', 'fork',
+        'chair', 'wine glass', 'apple', 'truck', 'cell phone', 'cup', 'car',
+        'knife', 'toilet', 'clock', 'backpack', 'spoon', 'vase', 'book',
+        'skateboard', 'sink', 'mouse', 'traffic light',
+    ]
+
+    def __init__(self, image_set, img_folder, ann_file, root, qd_root,
+                 transforms, return_masks, num_sketches=5):
         json_file = json.load(open(ann_file))
         self.coco_home = Path(root)
-        ROOT = self.coco_home / 'annotations'  # TODO: Refactor this
-        classes = json_file['categories']
-        # self.sketch_save_dir = Path('saved_images_local_5')
-        # self.sketch_save_dir.mkdir(parents=True, exist_ok=True)
+        ROOT = self.coco_home / 'annotations'
+
         self.id2class = {}
         self.class2id = {}
-
-        for cat in classes:
+        for cat in json_file['categories']:
             self.id2class[cat['id']] = cat['name']
             self.class2id[cat['name']] = cat['id']
 
-        self.all_categories = ['elephant', 'bear', 'cat', 'zebra', 'bus', 'horse', 'giraffe', 'airplane', 'bed', 'dog', 'scissors', 'train', 'sandwich', 'pizza', 'cow',
-                                'broccoli', 'umbrella', 'sheep', 'bird', 'stop sign', 'toothbrush', 'bicycle', 'hot dog', 'laptop', 'toaster', 'microwave', 'banana', 'baseball bat',
-                                'donut', 'couch', 'keyboard', 'cake', 'oven', 'carrot', 'bench', 'suitcase', 'fire hydrant', 'fork', 'chair', 'wine glass', 'apple', 'truck', 'cell phone',
-                                'cup', 'car', 'knife', 'toilet', 'clock', 'backpack', 'spoon', 'vase', 'book', 'skateboard', 'sink', 'mouse', 'traffic light']
-        
-   
-        unseen_cats = [self.all_categories[i] for i in range(len(self.all_categories)) if i%4==0]
-        images = []
-        annotate = []
-        selected_image_ids = []
-        to_remove_image_ids = []
-
+        # Filter annotations to the supported category subset
+        annotate, selected_image_ids = [], []
         for anno in json_file['annotations']:
-            img_id = anno['image_id']
-            if self.id2class[anno['category_id']] in self.all_categories:
+            if self.id2class[anno['category_id']] in self.ALL_CATEGORIES:
                 annotate.append(anno)
-                selected_image_ids.append(img_id)
-            
+                selected_image_ids.append(anno['image_id'])
 
         selected_image_ids = set(selected_image_ids)
-        
-        for image in json_file['images']:
-            img_id = image['id']
-            if img_id in selected_image_ids:
-                images.append(image)
-        
+        images = [img for img in json_file['images']
+                  if img['id'] in selected_image_ids]
+
         json_file['annotations'] = annotate
         json_file['images'] = images
-        json.dump(json_file, open(ROOT/ f'temp_json_file_{image_set}.json', 'w'))
-        temp_ann_file = ROOT / f'temp_json_file_{image_set}.json'
-        super().__init__(img_folder, temp_ann_file)
-        self.image_set = image_set
-        self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        temp_ann = ROOT / f'temp_json_file_{image_set}.json'
+        json.dump(json_file, open(temp_ann, 'w'))
 
+        super().__init__(img_folder, temp_ann)
+        self.image_set   = image_set
+        self._transforms = transforms
+        self.prepare     = ConvertCocoPolysToMask(return_masks)
+        self.num_sketches = num_sketches
 
         self.transforms_sketch = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
-            normalize_transform()
-            ])
-        _quickdraw_path = "/home/rahul/locformer-SGOL/checkpoints/processed_quick_draw_paths_purified.pkl"  # TODO: Refactor this
-        _quickdraw_path = pickle.load(open(_quickdraw_path, 'rb'))
+            normalize_transform(),
+        ])
 
-        print("Loading Quick,Draw! ...")
-        if image_set == 'train':
-            _quickdraw_path = _quickdraw_path['train_x']
-        else:
-            _quickdraw_path = _quickdraw_path['valid_x']
-
-        self.class2quick = defaultdict(list)
-        
-        for path in _quickdraw_path:
-            cat = path.split('/')[-2]
-            self.class2quick[cat].append(path)
-        self.image_set = image_set
+        # SLIP-style mmap index
+        split = 'train' if image_set == 'train' else 'valid'
+        print(f'[CocoDetectionQD] Loading QuickDraw mmap index ({split}) from {qd_root} ...')
+        self.qd_index = QuickDrawIndex(qd_root, self.ALL_CATEGORIES, split=split)
 
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
-        if not self.image_set == 'train':
+
+        # Fix random seed for reproducible val sketches
+        if self.image_set != 'train':
             random.seed(14)
         else:
-            t = 1000 * time.time()
-            random.seed(t)
+            random.seed(int(1000 * time.time()) & 0xFFFFFFFF)
+
         image_id = self.ids[idx]
-        target = {'image_id': image_id, 'annotations': target}
-        # img.save("saved_images/target_image"+str(idx)+".png")
+        target   = {'image_id': image_id, 'annotations': target}
         img, target = self.prepare(img, target)
+
+        # Pick a random category present in this image as the query
         categories = list(set(target['labels'].tolist()))
-        new_target = {}
+        if not categories:
+            return self.__getitem__(random.randint(0, len(self) - 1))
         selected_cat = random.choice(categories)
-        
-        keep = target['labels']==selected_cat
 
+        # Keep only annotations for the selected category
+        keep = target['labels'] == selected_cat
+        new_target = {}
         selected_keys = ['boxes', 'labels', 'area', 'iscrowd', 'masks']
-
-
         for key, value in target.items():
-            if key in selected_keys:
-                new_target[key] = value[keep]
-            else:
-                new_target[key] = value
-        
+            new_target[key] = value[keep] if key in selected_keys else value
         new_target['labels'] = torch.ones_like(new_target['labels'])
-        
-        selected_cat = self.id2class[selected_cat]
 
-        sketches = random.choices(self.class2quick[selected_cat], k=5)
-        sketch_list = []
-        # i = 0
-        for sketch in sketches:
-            sketch = self._resolve_path(sketch)
-            sketch = pickle.load(open(sketch, 'rb'))
-            key = list(sketch.keys())[0]
-            sketch = convert_to_np_raw(sketch[key])
-            # if i == 2:
-            #     sketch.save(str(self.sketch_save_dir / f"query_sketch{idx}.png"))
-            # i += 1
-            sketch = 255 - np.asarray(sketch)
-            sketch = Image.fromarray(sketch)
-            sketch = self.transforms_sketch(sketch)
-            sketch_list.append(sketch.unsqueeze(0))
-        sketch_list = torch.cat(sketch_list, dim=0)
+        selected_cat_name = self.id2class[selected_cat]
+
+        # Sample QuickDraw sketches for the query category via mmap
+        if self.qd_index.has_class(selected_cat_name):
+            pil_sketches = self.qd_index.sample_pil(selected_cat_name, k=self.num_sketches)
+        else:
+            # Fallback: blank white sketches if class is missing from the index
+            pil_sketches = [Image.new('RGB', (224, 224), (255, 255, 255))] * self.num_sketches
+
+        sketch_list = torch.stack([self.transforms_sketch(sk) for sk in pil_sketches])
+        # sketch_list: [num_sketches, 3, 224, 224]
 
         old_boxes = new_target['boxes'].clone()
         if self._transforms is not None:
             img, new_target = self._transforms(img, new_target)
 
-        if not self.image_set == 'train':
+        if self.image_set != 'train':
             new_target['new_boxes'] = new_target['boxes']
-            new_target['boxes'] = old_boxes
+            new_target['boxes']     = old_boxes
 
         return img, new_target, sketch_list
-    def _resolve_path(self, sketch_path):
-        sketch_path = Path(sketch_path)
-        if sketch_path.is_absolute():
-            return Path(*self.coco_home.parts, *sketch_path.parts[4:])
-        return sketch_path
 
+
+# ---------------------------------------------------------------------------
+# Dataset: COCO detection + Sketchy sketch queries
+# ---------------------------------------------------------------------------
 class CocoDetectionSketchy(torchvision.datasets.CocoDetection):
-    def __init__(self, image_set, img_folder, ann_file, root, transforms, return_masks):
-        # super(CocoDetection, self).__init__(img_folder, ann_file)
+
+    ALL_CATEGORIES = [
+        'elephant', 'bear', 'cat', 'zebra', 'horse', 'giraffe', 'airplane',
+        'dog', 'scissors', 'pizza', 'cow', 'umbrella', 'sheep', 'bicycle',
+        'hot dog', 'banana', 'couch', 'bench', 'chair', 'apple', 'cup',
+        'car', 'knife', 'clock', 'spoon', 'mouse', 'motorcycle',
+    ]
+
+    def __init__(self, image_set, img_folder, ann_file, root, sketchy_pkl,
+                 sketchy_root, transforms, return_masks, num_sketches=5):
         json_file = json.load(open(ann_file))
         self.coco_home = Path(root)
-        ROOT = self.coco_home / 'annotations' # TODO: Refactor this
-        classes = json_file['categories']
-        sketchy_path = "/home/rahul/coco/sketch_data/sketchy_dataset.pkl" #  # TODO: Refactor this
-        sketchy_path = pickle.load(open(sketchy_path, 'rb'))
+        ROOT = self.coco_home / 'annotations'
+
+        sketchy_data = pickle.load(open(sketchy_pkl, 'rb'))
+
         self.id2class = {}
         self.class2id = {}
-
-        for cat in classes:
+        for cat in json_file['categories']:
             self.id2class[cat['id']] = cat['name']
             self.class2id[cat['name']] = cat['id']
 
-        self.all_categories = ['elephant', 'bear', 'cat', 'zebra',  'horse', 'giraffe', 'airplane', 'dog', 'scissors', 'pizza', 'cow',
-                                'umbrella', 'sheep', 'bicycle', 'hot dog', 'banana', 'couch','bench', 'chair', 'apple','cup', 'car', 
-                                'knife', 'clock', 'spoon', 'mouse', 'motorcycle']
-        
-
-        images = []
-        annotate = []
-        selected_image_ids = []
-        to_remove_image_ids = []
-
+        annotate, selected_image_ids = [], []
         for anno in json_file['annotations']:
-            img_id = anno['image_id']
-            if self.id2class[anno['category_id']] in self.all_categories:
+            if self.id2class[anno['category_id']] in self.ALL_CATEGORIES:
                 annotate.append(anno)
-                selected_image_ids.append(img_id)
+                selected_image_ids.append(anno['image_id'])
 
-        to_remove_image_ids  = []
         selected_image_ids = set(selected_image_ids)
-                
-        for image in json_file['images']:
-            img_id = image['id']
-            if img_id in selected_image_ids:
-                images.append(image)
-        
+        images = [img for img in json_file['images']
+                  if img['id'] in selected_image_ids]
+
         json_file['annotations'] = annotate
         json_file['images'] = images
-        json.dump(json_file, open(ROOT+'/'+'temp_json_file_'+image_set+'.json', 'w'))
-        temp_ann_file = os.path.join(ROOT, 'temp_json_file_'+image_set+'.json')
-        super(CocoDetectionSketchy, self).__init__(img_folder, temp_ann_file)
-        self.image_set = image_set
-        self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        temp_ann = os.path.join(ROOT, f'temp_json_file_{image_set}.json')
+        json.dump(json_file, open(temp_ann, 'w'))
 
+        super().__init__(img_folder, temp_ann)
+        self.image_set    = image_set
+        self._transforms  = transforms
+        self.prepare      = ConvertCocoPolysToMask(return_masks)
+        self.num_sketches = num_sketches
+        self.sketchy_root = sketchy_root
 
         self.transforms_sketch = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((224,224)),
+            torchvision.transforms.Resize((224, 224)),
             torchvision.transforms.ToTensor(),
-            normalize_transform()
-            ])
-        
-        print("Loading Sketchy! ...")
+            normalize_transform(),
+        ])
 
-        if image_set == 'train':
-            self.class2quick = sketchy_path['train']
-        else:
-            self.class2quick = sketchy_path['valid']
-        
-        self.sketchy_root = "/home/rahul/coco/sketch_data/images" # TODO: Refactor this
-        self.image_set = image_set
-    
+        self.class2quick = (sketchy_data['train'] if image_set == 'train'
+                            else sketchy_data['valid'])
+        print(f'[CocoDetectionSketchy] Loaded Sketchy ({image_set}).')
 
     def __getitem__(self, idx):
-        img, target = super(CocoDetectionSketchy, self).__getitem__(idx)
-        if not self.image_set == 'train':
+        img, target = super().__getitem__(idx)
+
+        if self.image_set != 'train':
             random.seed(14)
         else:
-            t = 1000 * time.time()
-            random.seed(t)
+            random.seed(int(1000 * time.time()) & 0xFFFFFFFF)
+
         image_id = self.ids[idx]
-        target = {'image_id': image_id, 'annotations': target}
-
+        target   = {'image_id': image_id, 'annotations': target}
         img, target = self.prepare(img, target)
+
         categories = list(set(target['labels'].tolist()))
-        new_target = {}
+        if not categories:
+            return self.__getitem__(random.randint(0, len(self) - 1))
         selected_cat = random.choice(categories)
-        
-        keep = target['labels']==selected_cat
 
+        keep = target['labels'] == selected_cat
+        new_target = {}
         selected_keys = ['boxes', 'labels', 'area', 'iscrowd', 'masks']
-
-
         for key, value in target.items():
-            if key in selected_keys:
-                new_target[key] = value[keep]
-            else:
-                new_target[key] = value
-        
+            new_target[key] = value[keep] if key in selected_keys else value
         new_target['labels'] = torch.ones_like(new_target['labels'])
-        
-        selected_cat = self.id2class[selected_cat]
 
-        sketches = random.choices(self.class2quick[selected_cat], k=5)
-        sketch_list = []
-        for sketch in sketches:
-            sketch = Image.open(os.path.join(self.sketchy_root, sketch+'.png')).convert('RGB')
-            sketch = self.transforms_sketch(sketch)
+        selected_cat_name = self.id2class[selected_cat]
 
+        sketch_stems = random.choices(self.class2quick[selected_cat_name], k=self.num_sketches)
+        sketch_list  = []
+        for stem in sketch_stems:
+            sk = Image.open(os.path.join(self.sketchy_root, stem + '.png')).convert('RGB')
+            sketch_list.append(self.transforms_sketch(sk))
+        sketch_list = torch.stack(sketch_list)   # [num_sketches, 3, 224, 224]
 
-            sketch_list.append(sketch.unsqueeze(0))
-
-        sketch_list = sketch_list[0].squeeze(0)
-        
-        
         old_boxes = new_target['boxes'].clone()
         if self._transforms is not None:
             img, new_target = self._transforms(img, new_target)
 
-        if not self.image_set == 'train':
+        if self.image_set != 'train':
             new_target['new_boxes'] = new_target['boxes']
-            new_target['boxes'] = old_boxes        
+            new_target['boxes']     = old_boxes
 
         return img, new_target, sketch_list
-    def _resolve_path(self, sketch_path):
-        sketch_path = Path(sketch_path)
-        if sketch_path.is_absolute():
-            return Path(*self.coco_home.parts, *sketch_path.parts[4:])
-        return sketch_path
+
+
+# ---------------------------------------------------------------------------
+# COCO polygon / mask helpers
+# ---------------------------------------------------------------------------
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
     for polygons in segmentations:
@@ -370,81 +389,77 @@ def convert_coco_poly_to_mask(segmentations, height, width):
     return masks
 
 
-class ConvertCocoPolysToMask(object):
+class ConvertCocoPolysToMask:
     def __init__(self, return_masks=False):
         self.return_masks = return_masks
 
     def __call__(self, image, target):
         w, h = image.size
 
-        image_id = target["image_id"]
-        image_id = torch.tensor([image_id])
+        image_id = torch.tensor([target["image_id"]])
+        anno     = [obj for obj in target["annotations"]
+                    if 'iscrowd' not in obj or obj['iscrowd'] == 0]
 
-        anno = target["annotations"]
-
-        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
-
-        boxes = [obj["bbox"] for obj in anno]
-        # guard against no boxes via resizing
-        boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        boxes = torch.as_tensor(
+            [obj["bbox"] for obj in anno], dtype=torch.float32
+        ).reshape(-1, 4)
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes = [obj["category_id"] for obj in anno]
-        classes = torch.tensor(classes, dtype=torch.int64)
+        classes = torch.tensor([obj["category_id"] for obj in anno], dtype=torch.int64)
 
         if self.return_masks:
-            segmentations = [obj["segmentation"] for obj in anno]
-            masks = convert_coco_poly_to_mask(segmentations, h, w)
+            masks = convert_coco_poly_to_mask(
+                [obj["segmentation"] for obj in anno], h, w
+            )
 
         keypoints = None
         if anno and "keypoints" in anno[0]:
-            keypoints = [obj["keypoints"] for obj in anno]
-            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
-            num_keypoints = keypoints.shape[0]
-            if num_keypoints:
-                keypoints = keypoints.view(num_keypoints, -1, 3)
+            keypoints = torch.as_tensor(
+                [obj["keypoints"] for obj in anno], dtype=torch.float32
+            )
+            if keypoints.shape[0]:
+                keypoints = keypoints.view(keypoints.shape[0], -1, 3)
 
-        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
-        boxes = boxes[keep]
+        keep    = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        boxes   = boxes[keep]
         classes = classes[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
             keypoints = keypoints[keep]
 
-        target = {}
-        target["boxes"] = boxes
-        target["labels"] = classes
+        target = {
+            "boxes":     boxes,
+            "labels":    classes,
+            "image_id":  image_id,
+            "orig_size": torch.as_tensor([int(h), int(w)]),
+            "size":      torch.as_tensor([int(h), int(w)]),
+            "area":      torch.tensor([obj["area"] for obj in anno])[keep],
+            "iscrowd":   torch.tensor(
+                [obj.get("iscrowd", 0) for obj in anno])[keep],
+        }
         if self.return_masks:
             target["masks"] = masks
-        target["image_id"] = image_id
         if keypoints is not None:
             target["keypoints"] = keypoints
-
-        # for conversion to coco api
-        area = torch.tensor([obj["area"] for obj in anno])
-        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
-        target["area"] = area[keep]
-        target["iscrowd"] = iscrowd[keep]
-
-        target["orig_size"] = torch.as_tensor([int(h), int(w)])
-        target["size"] = torch.as_tensor([int(h), int(w)])
 
         return image, target
 
 
+# ---------------------------------------------------------------------------
+# Image transforms
+# ---------------------------------------------------------------------------
 def make_coco_transforms(image_set, args):
-
     normalize = T.Compose([
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
+    scales = [480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640,
+              656, 672, 688, 704, 720, 736, 752, 768, 784, 800]
 
-    scales = [480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800]
-
-    print("Resolution: shortest at most", max(scales))
+    print(f'Resolution: shortest at most {max(scales)}')
     if image_set == 'train':
         return T.Compose([
             T.RandomHorizontalFlip(),
@@ -454,36 +469,38 @@ def make_coco_transforms(image_set, args):
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
-                ])
+                ]),
             ),
             normalize,
         ])
 
-    print(args.eval_size)
-
     if image_set == 'val':
+        print(args.eval_size)
         return T.Compose([
             T.RandomResize([args.eval_size], max_size=args.eval_size * 1333 // 800),
             normalize,
         ])
 
-    raise ValueError(f'unknown {image_set}')
+    raise ValueError(f'unknown image_set: {image_set}')
 
 
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
 def build(image_set, args):
     root = Path(args.coco_path)
     assert root.exists(), f'provided COCO path {root} does not exist'
 
-    mode = 'instances'
+    mode  = 'instances'
     PATHS = {
         "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
-        "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
+        "val":   (root / "val2017",   root / "annotations" / f'{mode}_val2017.json'),
     }
-
     img_folder, ann_file = PATHS[image_set]
-    dataset = CocoDetectionQD(image_set, img_folder, ann_file, root,
-                            transforms=make_coco_transforms(image_set, args),
-                            return_masks=True)
-    return dataset
 
-# TODO: Build a testing code on `__main__` to verify the dataset loading properly
+    return CocoDetectionQD(
+        image_set, img_folder, ann_file, root,
+        qd_root=args.qd_root,
+        transforms=make_coco_transforms(image_set, args),
+        return_masks=True,
+    )

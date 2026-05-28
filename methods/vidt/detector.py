@@ -7,7 +7,6 @@
 # ------------------------------------------------------------------------
 """Build a VIDT detector for object detection."""
 
-from turtle import pos
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -295,14 +294,13 @@ class Detector(nn.Module):
         nn.init.xavier_uniform_(self.query_pos_proj[0].weight, gain=1)
         nn.init.constant_(self.query_pos_proj[0].bias, 0)
 
-        # trans definition
-        # self.trans = torch.nn.Sequential(
-        #                                 torch.nn.ReLU(),
-        #                                 torch.nn.Linear(
-        #                                     in_features=hidden_dim,
-        #                                     out_features=hidden_dim
-        #                                 )
-        #                             )
+        self.trans = torch.nn.Sequential(
+                                        torch.nn.ReLU(),
+                                        torch.nn.Linear(
+                                            in_features=hidden_dim,
+                                            out_features=hidden_dim
+                                        )
+                                    )
         self.sketch_embedding = torchvision.models.resnet50(pretrained=True)
         if has_sketch_emb_pt:
             state_dict = torch.load("/path/to/sketch-encoder/best_model.pt") # TODO: What's here?
@@ -346,7 +344,7 @@ class Detector(nn.Module):
         # set up all required nn.Module for additional techniques
         if with_box_refine:
             self.class_embed_v2 = _get_clones(self.class_embed_v2, num_pred)
-            # self.trans = _get_clones(self.trans, num_pred)
+            self.trans = _get_clones(self.trans, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
@@ -397,28 +395,18 @@ class Detector(nn.Module):
         x = samples[0]
         mask = samples[1]
 
-        bs = sketches.shape[0]
-        if sketches.dim() == 5:
-            num_sketches = sketches.shape[1]
-            sketches = sketches.view(bs * num_sketches, sketches.shape[2], sketches.shape[3], sketches.shape[4])
-        elif sketches.dim() == 4:
-            num_sketches = 1
-        else:
-            raise ValueError(f"Expected sketches tensor to be 4D or 5D, got {sketches.dim()}D")
-
+        bs, num_sk, c, h, w = sketches.shape
+        sketches = sketches.view(bs * num_sk, c, h, w)
         sketches = self.sketch_embedding(sketches)
-        _, c, h, w = sketches.shape
-        sketches = sketches.view(bs, num_sketches, c, h, w).mean(dim=1)
+        
+        sketches = sketches.view(bs*num_sk,2048,7,7)
         sketches = self.gp_norm(sketches)
-        # project sketches to the same dimension as x
+        #  project sketches to the same dimension as x
         sketches = self.sketch_proj(sketches)
-
-        bs = sketches.shape[0]
-
 
         # return multi-scale [PATCH] tokens along with final [DET] tokens and their pos encodings
         # use the sketch guided transformer to generate features for images (x)
-        features, det_tgt, det_pos = self.backbone(x, mask, sketches)
+        features, det_tgt, det_pos = self.backbone(x, mask, sketches)               
         
 
         # [DET] token and encoding projection to compact representation for the input to the Neck-free transformer
@@ -429,10 +417,6 @@ class Detector(nn.Module):
         
         
         # [PATCH] token projection
-        shapes = []
-        for l, src in enumerate(features):
-            shapes.append(src.shape[-2:])
-        
         srcs = []
         # if self.fusion is None:
         if True:
@@ -442,12 +426,9 @@ class Detector(nn.Module):
         else:
             # multi-scale fusion is used if fusion is not None
             srcs = self.fusion(features)
-        
 
         masks = []
         for l, src in enumerate(srcs):
-            # resize mask
-            shapes.append(src.shape[-2:])
             _mask = F.interpolate(mask[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
             masks.append(_mask)
             assert mask is not None
@@ -480,13 +461,14 @@ class Detector(nn.Module):
                 sketches = sketches.permute(0,2,1).view(bs,d,w,h)
 
             else:
-                glob_sketch = sketches.max(-1)[0].max(-1)[0]
-                glob_sketch = glob_sketch.unsqueeze(1).repeat(1, self.num_queries,1)
+                glob_sketch = sketches.max(-1)[0].max(-1)[0]           # [bs*num_sk, 256]
+                glob_sketch = glob_sketch.view(bs, num_sk, -1).mean(1)  # [bs, 256]
+                glob_sketch = glob_sketch.unsqueeze(1).repeat(1, self.num_queries, 1)  # [bs, num_queries, 256]
                 a = hs[lvl]
 
             
             
-            sk = glob_sketch #self.trans[lvl](glob_sketch)
+            sk = self.trans[lvl](glob_sketch)
                         
             # a = torch.cat([sk, hs[lvl]], dim=-1)
             a = torch.cat([sk, a], dim=-1)

@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=rn50_qd_pt                    # Job name
-#SBATCH --output=outputs/rn50_qd_pt_%j.log        # Standard output log (%j = job ID)
-#SBATCH --error=outputs/rn50_qd_pt_%j.err         # Standard error log
-#SBATCH --time=1-00:00:00                     # Time limit (dd-hh:mm:ss)
-#SBATCH --ntasks=2                            # Number of tasks (typically 1 for single-node jobs)
-#SBATCH --cpus-per-task=8                     # Number of CPUs per task
+#SBATCH --job-name=rn50_qd_pt                  # Job name
+#SBATCH --output=outputs/rn50_qd_pt_%j.log     # Standard output log (%j = job ID)
+#SBATCH --error=outputs/rn50_qd_pt_%j.err      # Standard error log
+#SBATCH --time=1-00:00:00                      # Time limit (dd-hh:mm:ss)
+#SBATCH --ntasks=2                             # Number of tasks (typically 1 for single-node jobs)
+#SBATCH --cpus-per-task=8                      # Number of CPUs per task
 #SBATCH --mem=140GB                            # Memory allocation
 #SBATCH --partition=h200                       # Partition (long/queue)
-#SBATCH --gres=gpu:h200:2                  # GPU allocation (if needed, modify accordingly)
-#SBATCH --account=freerun
+#SBATCH --gres=gpu:h200:2                      # GPU allocation (if needed, modify accordingly)
+#SBATCH --account=research
 # =============================================================
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
@@ -43,6 +43,7 @@ python -u -m torch.distributed.run \
     --master_port $MASTER_PORT \
     resnet_pretrainer.py \
     --batch-size 2987 \
+    --warmup-epochs 5 \
     --run-name "r50-sgd" \
     --wandb-project "resnet50-quickdraw-pt" \
     --ddp

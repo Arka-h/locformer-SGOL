@@ -72,6 +72,9 @@ def get_args_parser():
     # * Dataset
     parser.add_argument('--dataset_file', default='coco')
     parser.add_argument('--coco_path', default='/home/Research/MyData/COCO2017', type=str)
+    parser.add_argument('--qd_root', default='', type=str,
+                        help='path to SLIP-style QuickDraw npy files '
+                             '({class}.{split}.ptr.npy + {class}.{split}.strokes.npy)')
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 

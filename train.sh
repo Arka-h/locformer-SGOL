@@ -1,4 +1,4 @@
-p#!/bin/bash
+#!/bin/bash
 #SBATCH --job-name=lf_base                    # Job name
 #SBATCH --output=outputs/lf_base_%j.log        # Standard output log (%j = job ID)
 #SBATCH --error=outputs/lf_base_%j.err         # Standard error log

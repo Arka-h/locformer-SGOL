@@ -26,7 +26,55 @@ from arguments import get_args_parser
 import argparse
 import wandb
 
-wandb.init(project="my-test-project", entity="aurkohaldi")
+def _wandb_safe_config(args):
+    cfg = {}
+    for k, v in vars(args).items():
+        # make sure Paths / weird types don't break serialization
+        if isinstance(v, Path):
+            cfg[k] = str(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+def setup_wandb(args, run_name=None):
+    if not utils.is_main_process():
+        return None
+
+    project = os.getenv("WANDB_PROJECT", "locformer-SGOL")
+    entity  = os.getenv("WANDB_ENTITY", "aurkohaldi")
+
+    run_id_path = None
+    run_id = None
+    if getattr(args, "output_dir", None):
+        run_id_path = Path(args.output_dir) / "wandb_run_id.txt"
+        if run_id_path.exists():
+            run_id = run_id_path.read_text().strip() or None
+
+    run = wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
+        id=run_id,
+        resume="allow",
+        config=_wandb_safe_config(args),
+        dir=getattr(args, "output_dir", None),
+        settings=wandb.Settings(start_method="thread"),
+    )
+
+    if run_id_path is not None and (run_id is None):
+        run_id_path.write_text(run.id)
+
+    # nice metric grouping
+    wandb.define_metric("epoch")
+    wandb.define_metric("train_*", step_metric="epoch")
+    wandb.define_metric("test_*",  step_metric="epoch")
+    wandb.define_metric("lr/*",    step_metric="epoch")
+    wandb.define_metric("time/*",  step_metric="epoch")
+
+    # optional (can be heavy):
+    # wandb.watch(model, log="gradients", log_freq=200)
+
+    return run
 
 def build_distil_model(args):
     """ build a teacher model """
@@ -55,7 +103,11 @@ def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
     print(args)
-
+    wandb_run = None
+    if utils.is_main_process():
+        run_name = os.path.basename(args.output_dir) if args.output_dir else None
+        wandb_run = setup_wandb(args, run_name=run_name)
+        wandb.config.update({"git_sha": utils.get_sha()}, allow_val_change=True)
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -100,8 +152,7 @@ def main(args):
 
     # optimizer setup
     def build_optimizer(model, args):
-        if hasattr(model.backbone, 'no_weight_decay'):
-            skip = model.backbone.no_weight_decay()
+        skip = model.backbone.no_weight_decay() if hasattr(model.backbone, 'no_weight_decay') else set()
         head = []
         backbone_decay = []
         backbone_no_decay = []
@@ -173,6 +224,10 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            args.start_epoch = checkpoint['epoch'] + 1
         print('load a checkpoint from', args.resume)
 
     # only evaluation purpose
@@ -187,8 +242,8 @@ def main(args):
     print("Start training")
     start_time = time.time()
 
-
-    args.start_epoch = 0
+    if not args.resume:
+        args.start_epoch = 0
     for epoch in range(args.start_epoch, args.epochs):
 
         # specify the current epoch number for samplers
@@ -196,12 +251,12 @@ def main(args):
             sampler_train.set_epoch(epoch)
 
         if teacher_model is None:
-            # training one epoch with distillation with token matching
+            # training one epoch with default setting
             train_stats = train_one_epoch(
-                model, criterion, data_loader_train, optimizer, device, epoch,lr_scheduler, 
+                model, criterion, data_loader_train, optimizer, device, epoch,
                 args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq)
         else:
-            # training one epoch with default setting
+            # training one epoch with distillation with token matching
             train_stats = train_one_epoch_with_teacher(
                 model, teacher_model, criterion, data_loader_train, optimizer, device, epoch,
                 args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq)
@@ -232,6 +287,15 @@ def main(args):
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
+        if wandb_run is not None:
+            # log learning rates for each param group
+            lr_dict = {
+                "lr/head": optimizer.param_groups[0]["lr"],
+                "lr/backbone_no_decay": optimizer.param_groups[1]["lr"],
+                "lr/backbone_decay": optimizer.param_groups[2]["lr"],
+            }
+            wandb.log({**log_stats, **lr_dict}, step=epoch)
+
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -246,6 +310,8 @@ def main(args):
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
+    if wandb_run is not None:
+        wandb.finish()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
