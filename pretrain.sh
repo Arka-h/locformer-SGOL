@@ -3,12 +3,13 @@
 #SBATCH --output=outputs/rn50_qd_pt_%j.log     # Standard output log (%j = job ID)
 #SBATCH --error=outputs/rn50_qd_pt_%j.err      # Standard error log
 #SBATCH --time=1-00:00:00                      # Time limit (dd-hh:mm:ss)
-#SBATCH --ntasks=2                             # Number of tasks (typically 1 for single-node jobs)
+#SBATCH --ntasks=1                             # Number of tasks (typically 1 for single-node jobs)
 #SBATCH --cpus-per-task=8                      # Number of CPUs per task
 #SBATCH --mem=140GB                            # Memory allocation
 #SBATCH --partition=h200                       # Partition (long/queue)
-#SBATCH --gres=gpu:h200:2                      # GPU allocation (if needed, modify accordingly)
-#SBATCH --account=research
+#SBATCH --qos=h200_qos                          # QOS required by the h200 partition
+#SBATCH --gres=gpu:h200:1                      # GPU allocation (if needed, modify accordingly)
+#SBATCH --account=anirban
 # =============================================================
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
