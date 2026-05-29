@@ -1190,24 +1190,27 @@ class SwinTransformer(nn.Module):
 
                 # project sketch to same dim as patch
                 sket = self.attention_proj[stage](sketches)
-                
-                bs, d , w_s, h_s = sket.shape
-                # get position encding for sketch and patch
+
+                bs_img = x.shape[0]  # image batch size
+                d = x.shape[1]       # image channel dim at this stage
+                _, d_sk, w_s, h_s = sket.shape
+                num_sk = sket.shape[0] // bs_img
+                # aggregate across sketches before cross-attention: [bs*num_sk,d_sk,w,h] -> [bs,d_sk,w,h]
+                sket = sket.reshape(bs_img, num_sk, d_sk, w_s, h_s).mean(1)
+
+                # get position encoding for sketch and patch
                 pos_img = self.position_list[stage](x)
                 pos_sk = self.position_list_sk[stage](sket)
 
-                # flatten the position encding, sketches and patches
-                tokens = x.view(bs,d,-1).permute(0,2,1)
-                tokens_sk = sket.view(bs,d,-1).permute(0,2,1)
-                pos_img = pos_img.view(bs,d,-1).permute(0,2,1)
-                pos_sk = pos_sk.view(bs,d,-1).permute(0,2,1)
+                # flatten the position encoding, sketches and patches
+                tokens = x.reshape(bs_img,d,-1).permute(0,2,1)
+                tokens_sk = sket.reshape(bs_img,d,-1).permute(0,2,1)
+                pos_img = pos_img.reshape(bs_img,d,-1).permute(0,2,1)
+                pos_sk = pos_sk.reshape(bs_img,d,-1).permute(0,2,1)
 
                 # compute the attention map for each block and fuse the sketches to images
-                x, sket, tgt = self.attention[stage](tokens, pos_img, tokens_sk, pos_sk)
-                x = x.permute(0,2,1).view(bs,d,Wh,Ww)
-                tgt = tgt.permute(0,2,1).view(bs,d,Wh, Ww)
-                
-                
+                x, sket, _, _ = self.attention[stage](tokens, pos_img, tokens_sk, pos_sk)
+                x = x.permute(0,2,1).reshape(bs_img,d,Wh,Ww)
                 x = x.flatten(2).transpose(1,2)
 
             
@@ -1266,12 +1269,12 @@ def swin_nano(pretrained=None, **kwargs):
     model = SwinTransformer(pretrain_img_size=[224, 224], embed_dim=48, depths=[2, 2, 6, 2],
                             num_heads=[3, 6, 12, 24], window_size=7, drop_path_rate=0.0, **kwargs)
 
-    if pretrained is None or pretrained == 'none':
+    if pretrained is None or pretrained in ('', 'none', 'None'):
         return model, 384
 
-    if pretrained is not None:
+    if pretrained is not None and pretrained not in ('', 'none', 'None'):
         if pretrained == 'imagenet':
-            torch.hub._download_url_to_file(
+            torch.hub.download_url_to_file(
                     url="https://github.com/naver-ai/vidt/releases/download/v0.1-swin/swin_nano_patch4_window7_224.pth",
                 dst="checkpoint.pth"
             )
@@ -1299,7 +1302,7 @@ def swin_tiny(pretrained=None, *, weights_key="model", strict=False, map_locatio
     
     out_dim = 768 # embed_dim * 8 for Swin-T
     
-    if pretrained is None or pretrained == 'none':
+    if pretrained is None or pretrained in ('', 'none', 'None'):
         return model, out_dim
 
     if pretrained == 'imagenet':
@@ -1331,12 +1334,12 @@ def swin_small(pretrained=None, **kwargs):
     model = SwinTransformer(pretrain_img_size=[224, 224], embed_dim=96, depths=[2, 2, 18, 2],
                             num_heads=[3, 6, 12, 24], window_size=7, drop_path_rate=0.3, **kwargs)
 
-    if pretrained is None or pretrained == 'none':
+    if pretrained is None or pretrained in ('', 'none', 'None'):
         return model, 768
 
-    if pretrained is not None:
+    if pretrained is not None and pretrained not in ('', 'none', 'None'):
         if pretrained == 'imagenet':
-            torch.hub._download_url_to_file(
+            torch.hub.download_url_to_file(
                 url="https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_small_patch4_window7_224.pth",
                 dst="checkpoint.pth"
             )
@@ -1354,12 +1357,12 @@ def swin_base_win7(pretrained=None, **kwargs):
     model = SwinTransformer(pretrain_img_size=[224, 224], embed_dim=128, depths=[2, 2, 18, 2],
                             num_heads=[4, 8, 16, 32], window_size=7, drop_path_rate=0.3, **kwargs)
 
-    if pretrained is None or pretrained == 'none':
+    if pretrained is None or pretrained in ('', 'none', 'None'):
         return model, 1024
 
-    if pretrained is not None:
+    if pretrained is not None and pretrained not in ('', 'none', 'None'):
         if pretrained == 'imagenet':
-            torch.hub._download_url_to_file(
+            torch.hub.download_url_to_file(
                 url="https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224_22k.pth",
                 dst="checkpoint.pth"
             )
@@ -1377,12 +1380,12 @@ def swin_large_win7(pretrained=None, **kwargs):
     model = SwinTransformer(pretrain_img_size=[224, 224], embed_dim=192, depths=[2, 2, 18, 2],
                             num_heads=[6, 12, 24, 48], window_size=7, drop_path_rate=0.3, **kwargs)
 
-    if pretrained is None or pretrained == 'none':
+    if pretrained is None or pretrained in ('', 'none', 'None'):
         return model, 1024
 
-    if pretrained is not None:
+    if pretrained is not None and pretrained not in ('', 'none', 'None'):
         if pretrained == 'imagenet':
-            torch.hub._download_url_to_file(
+            torch.hub.download_url_to_file(
                 url="https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_large_patch4_window7_224_22k.pth",
                 dst="checkpoint.pth"
             )

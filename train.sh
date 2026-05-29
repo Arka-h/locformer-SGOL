@@ -52,6 +52,7 @@ python -u -m torch.distributed.run \
     --aux_loss True \
     --with_box_refine True \
     --coco_path $COCO_HOME \
+    --qd_root $QD_DATASET \
     --output_dir $PROJECT_HOME/outputs \
     --start_epoch 0 \
     --lr_drop 20 \

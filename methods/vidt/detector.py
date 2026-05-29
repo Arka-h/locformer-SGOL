@@ -446,19 +446,24 @@ class Detector(nn.Module):
             a = hs[lvl]
             
             if lvl >2:
-                sketch_query_pos = self.sketch_query_pos(sketches)
-                bs,d,w,h = sketches.shape
-                
-                tokens_sk = sketches.view(bs,d,-1).permute(0,2,1)
-                pos_img = det_pos
-                pos_sk = sketch_query_pos.view(bs,d,-1).permute(0,2,1)
-                # refine features of objects given the sketch features
-                a, sket = self.query_fusion[lvl](a,pos_img, tokens_sk, pos_sk)
-                # refine features of sketches given the object features
-                sketches, a_tgt = self.query_fusion_sketch[lvl](tokens_sk, pos_sk, a , pos_img)
-                
+                bs_actual = a.shape[0]                      # real batch size
+                bs_flat, d, w, h = sketches.shape           # bs_flat = bs*num_sk
+                num_sk_local = bs_flat // bs_actual
+                # aggregate across sketches → [bs, d, w, h]
+                sketches_agg = sketches.reshape(bs_actual, num_sk_local, d, w, h).mean(1)
 
-                sketches = sketches.permute(0,2,1).view(bs,d,w,h)
+                sketch_query_pos = self.sketch_query_pos(sketches_agg)
+                tokens_sk = sketches_agg.reshape(bs_actual, d, -1).permute(0, 2, 1)
+                pos_img = det_pos
+                pos_sk = sketch_query_pos.reshape(bs_actual, d, -1).permute(0, 2, 1)
+                # refine features of objects given the sketch features
+                a, sket = self.query_fusion[lvl](a, pos_img, tokens_sk, pos_sk)
+                # refine features of sketches given the object features
+                sketches_agg, _ = self.query_fusion_sketch[lvl](tokens_sk, pos_sk, a, pos_img)
+                # broadcast updated sketch back to [bs*num_sk, d, w, h] for next iteration
+                sketches = sketches_agg.permute(0, 2, 1).reshape(bs_actual, d, w, h) \
+                               .unsqueeze(1).expand(-1, num_sk_local, -1, -1, -1) \
+                               .reshape(bs_flat, d, w, h)
 
             else:
                 glob_sketch = sketches.max(-1)[0].max(-1)[0]           # [bs*num_sk, 256]
