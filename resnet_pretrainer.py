@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -186,25 +187,33 @@ def _scale_lr(base_lr: float, batch_size: int, world_size: int) -> float:
     return base_lr * (batch_size * world_size / 256)
 
 
-def build_scheduler(optimizer, epochs: int, warmup_epochs: int):
+def build_scheduler(optimizer, epochs: int, warmup_epochs: int, steps_per_epoch: int):
     """
-    Cosine annealing with optional linear warmup.
-    For large scaled LRs (> ~0.2), warmup_epochs ≥ 5 is recommended to
-    avoid loss spikes at the start of training.
+    Per-iteration linear-warmup → cosine-decay schedule (LambdaLR, stepped every
+    optimizer step). Warmup ramps 0.01·peak → peak over warmup_epochs·steps_per_epoch
+    iterations (the smooth ramp the linear-scaling rule assumes), then cosine decays
+    peak → 0 over the remaining iterations. The multiplier is applied on top of the
+    optimizer's base lr (= the resolved peak LR), so peak == base lr.
     """
-    if warmup_epochs > 0:
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0,
-            total_iters=warmup_epochs,
-        )
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(epochs - warmup_epochs, 1),
-        )
-        return torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, cosine],
-            milestones=[warmup_epochs],
-        )
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    total_iters  = max(epochs * steps_per_epoch, 1)
+    warmup_iters = max(warmup_epochs * steps_per_epoch, 0)
+
+    def lr_lambda(it):
+        if warmup_iters > 0 and it < warmup_iters:
+            return 0.01 + 0.99 * it / warmup_iters          # 0.01·peak → peak
+        prog = (it - warmup_iters) / max(total_iters - warmup_iters, 1)
+        prog = min(max(prog, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * prog))        # peak → 0 (cosine)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _resolve_peak_lr(args_lr, peak_lr, batch_size, world_size):
+    """peak_lr > 0 overrides the linear-scaling rule (preferred for fine-tuning).
+    Otherwise fall back to the Goyal'17 linear scaling of the base lr."""
+    if peak_lr and peak_lr > 0:
+        return peak_lr
+    return _scale_lr(args_lr, batch_size, world_size)
 
 
 # ---------------------------------------------------------------------------
@@ -219,19 +228,40 @@ def _load_model_state(model, state_dict):
     target.load_state_dict(state_dict)
 
 
+def _define_wandb_metrics(run):
+    """Plot every train/* and val/* metric against global step on the x-axis."""
+    if run is None:
+        return
+    run.define_metric("train/global_step")
+    run.define_metric("train/*", step_metric="train/global_step")
+    run.define_metric("val/*",   step_metric="train/global_step")
+
+
 def save_checkpoint(model, optimizer, scheduler, scaler,
-                    epoch, global_step, best_val_acc, checkpoint_dir):
-    """Full training state — used for resume."""
+                    epoch, global_step, best_val_acc, checkpoint_dir,
+                    epoch_completed=True):
+    """Full training state — used for resume.
+
+    epoch_completed distinguishes an end-of-epoch save (scheduler has not yet
+    stepped for `epoch`; resume at epoch+1) from a mid-epoch step save
+    (scheduler state matches the start of `epoch`; resume at `epoch`).
+    """
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    # Atomic write: save to a temp file then rename, so a kill mid-write can
+    # never corrupt the checkpoint we resume from.
+    final = Path(checkpoint_dir) / CHECKPOINT_FILENAME
+    tmp   = final.with_suffix(".pth.tmp")
     torch.save({
         "epoch":           epoch,
+        "epoch_completed": epoch_completed,
         "global_step":     global_step,
         "best_val_acc":    best_val_acc,
         "model_state":     _get_model_state(model),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state":    scaler.state_dict() if scaler is not None else {},
-    }, Path(checkpoint_dir) / CHECKPOINT_FILENAME)
+    }, tmp)
+    tmp.replace(final)
 
 
 def save_best_checkpoint(model, val_acc, epoch, checkpoint_dir):
@@ -263,12 +293,19 @@ def load_checkpoint_if_available(model, optimizer, scheduler, scaler,
         scheduler.load_state_dict(ckpt["scheduler_state"])
     if scaler is not None and "scaler_state" in ckpt:
         scaler.load_state_dict(ckpt["scaler_state"])
-    start_epoch  = ckpt.get("epoch", 0) + 1
-    global_step  = ckpt.get("global_step", 0)
-    best_val_acc = ckpt.get("best_val_acc", 0.0)
+    # Mid-epoch saves resume at the same epoch (scheduler not yet stepped for it);
+    # end-of-epoch saves resume at the next epoch. Legacy checkpoints lack the
+    # flag and are treated as completed epochs (default True).
+    saved_epoch     = ckpt.get("epoch", 0)
+    epoch_completed = ckpt.get("epoch_completed", True)
+    start_epoch     = saved_epoch + 1 if epoch_completed else saved_epoch
+    global_step     = ckpt.get("global_step", 0)
+    best_val_acc    = ckpt.get("best_val_acc", 0.0)
     if notify:
-        print(f"[checkpoint] resumed {path.name} at epoch {start_epoch} "
-              f"(step {global_step}, best_val_acc {best_val_acc:.4f})", flush=True)
+        where = "end of epoch" if epoch_completed else "mid-epoch"
+        print(f"[checkpoint] resumed {path.name} ({where}) -> start epoch "
+              f"{start_epoch} (step {global_step}, best_val_acc {best_val_acc:.4f})",
+              flush=True)
     return start_epoch, global_step, best_val_acc
 
 
@@ -295,7 +332,8 @@ def _build_class_to_idx(train_class_names, val_class_names):
 # ---------------------------------------------------------------------------
 def train_one_epoch(model, loader, optimizer, device, epoch, log_every,
                     run, global_step, scaler, use_amp, run_name,
-                    return_sums=False):
+                    return_sums=False, save_cb=None, ckpt_every=0,
+                    scheduler=None, grad_clip=0.0):
     model.train()
     criterion = nn.CrossEntropyLoss()
     running_loss, running_correct, total = 0.0, 0, 0
@@ -312,11 +350,20 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_every,
         loss_value = loss.item()
         if use_amp:
             scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)           # unscale before clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+
+        # per-iteration LR schedule (warmup + cosine)
+        if scheduler is not None:
+            scheduler.step()
 
         running_loss    += loss_value * images.size(0)
         preds            = outputs.argmax(dim=1)
@@ -327,11 +374,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_every,
         if global_step % log_every == 0:
             batch_acc = (preds == labels).float().mean().item()
             log_data  = {
-                "train/loss":  loss_value,
-                "train/acc":   batch_acc,
-                "train/epoch": epoch,
-                "train/step":  global_step,
-                "train/lr":    optimizer.param_groups[0]["lr"],
+                "train/loss":        loss_value,
+                "train/acc":         batch_acc,
+                "train/epoch":       epoch,
+                "train/global_step": global_step,
+                "train/lr":          optimizer.param_groups[0]["lr"],
             }
             if run is not None:
                 run.log(log_data)
@@ -342,6 +389,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_every,
                 f"epoch {epoch+1} | lr {optimizer.param_groups[0]['lr']:.3e}",
                 flush=True,
             )
+
+        # Mid-epoch checkpoint (main process only; save_cb encapsulates the guard).
+        if save_cb is not None and ckpt_every and global_step % ckpt_every == 0:
+            save_cb(epoch, global_step)
 
     if return_sums:
         return running_loss, running_correct, total, global_step
@@ -399,6 +450,8 @@ class JobConfig:
     log_every:      int
     momentum:       float
     warmup_epochs:  int
+    peak_lr:        float
+    grad_clip:      float
     project:        str
     entity:         Optional[str]
     run_name:       str
@@ -406,6 +459,7 @@ class JobConfig:
     wandb_mode:     str
     checkpoint_dir: str
     resume_from:    Optional[str]
+    ckpt_every_steps: int = 0
 
 
 def train_job(job_cfg):
@@ -421,6 +475,7 @@ def train_job(job_cfg):
             project=job_cfg.project, entity=job_cfg.entity,
             name=job_cfg.run_name, config=vars(job_cfg), reinit=True,
         )
+        _define_wandb_metrics(run)
 
     train_class_names = get_class_names(QD_ROOT, 'train', exclude=UNSEEN_CATS)
     val_class_names   = get_class_names(QD_ROOT, 'valid', exclude=UNSEEN_CATS)
@@ -436,10 +491,10 @@ def train_job(job_cfg):
 
     model = build_model(len(class_to_idx), device)
     # world_size=1: each parallel job is independent, not gradient-summed DDP
-    effective_lr = _scale_lr(job_cfg.lr, job_cfg.batch_size, world_size=1)
+    effective_lr = _resolve_peak_lr(job_cfg.lr, job_cfg.peak_lr, job_cfg.batch_size, world_size=1)
     optimizer  = torch.optim.SGD(model.parameters(), lr=effective_lr,
                                  momentum=job_cfg.momentum, weight_decay=job_cfg.weight_decay)
-    scheduler  = build_scheduler(optimizer, job_cfg.epochs, job_cfg.warmup_epochs)
+    scheduler  = build_scheduler(optimizer, job_cfg.epochs, job_cfg.warmup_epochs, len(loader))
     use_amp    = job_cfg.device.startswith("cuda") and torch.cuda.is_available()
     scaler     = torch.amp.GradScaler("cuda", enabled=use_amp)
     ckpt_root  = Path(job_cfg.checkpoint_dir) / job_cfg.run_name
@@ -450,13 +505,19 @@ def train_job(job_cfg):
           f"{len(class_to_idx)} classes | lr {effective_lr:.4f} | "
           f"starting epoch {start_epoch}/{job_cfg.epochs}", flush=True)
 
+    def save_cb(ep, step):
+        save_checkpoint(model, optimizer, scheduler, scaler,
+                        ep, step, best_val_acc, ckpt_root, epoch_completed=False)
+
     epoch_loss = epoch_acc = 0.0
     for epoch in range(start_epoch, job_cfg.epochs):
         epoch_loss, epoch_acc, global_step = train_one_epoch(
             model, loader, optimizer, device, epoch, job_cfg.log_every,
-            run, global_step, scaler, use_amp, job_cfg.run_name)
+            run, global_step, scaler, use_amp, job_cfg.run_name,
+            save_cb=save_cb, ckpt_every=job_cfg.ckpt_every_steps,
+            scheduler=scheduler, grad_clip=job_cfg.grad_clip)
         val_loss, val_acc = evaluate_one_epoch(model, val_loader, device, epoch, run)
-        scheduler.step()
+        # scheduler steps per-iteration inside train_one_epoch (warmup + cosine)
 
         print(
             f"[{job_cfg.run_name}] epoch {epoch+1}/{job_cfg.epochs} | "
@@ -509,9 +570,11 @@ def build_job_configs(args):
             epochs=args.epochs, momentum=args.momentum,
             lr=args.lr, weight_decay=args.weight_decay,
             log_every=args.log_every, warmup_epochs=args.warmup_epochs,
+            peak_lr=args.peak_lr, grad_clip=args.grad_clip,
             project=args.wandb_project, entity=args.wandb_entity,
             run_name=run_name, device=device, wandb_mode=WANDB_MODE,
             checkpoint_dir=args.checkpoint_dir, resume_from=args.resume_from,
+            ckpt_every_steps=args.ckpt_every_steps,
         ))
     return job_cfgs
 
@@ -535,9 +598,10 @@ def train_ddp(args):
             project=args.wandb_project, entity=args.wandb_entity,
             name=args.run_name, config=vars(args), reinit=True,
         )
+        _define_wandb_metrics(run)
 
     # world_size = number of DDP processes; batch_size is per-GPU
-    effective_lr = _scale_lr(args.lr, args.batch_size, utils.get_world_size())
+    effective_lr = _resolve_peak_lr(args.lr, args.peak_lr, args.batch_size, utils.get_world_size())
 
     train_class_names = get_class_names(QD_ROOT, 'train', exclude=UNSEEN_CATS)
     val_class_names   = get_class_names(QD_ROOT, 'valid', exclude=UNSEEN_CATS)
@@ -565,12 +629,18 @@ def train_ddp(args):
 
     optimizer = torch.optim.SGD(model.parameters(), lr=effective_lr,
                                 momentum=args.momentum, weight_decay=args.weight_decay)
-    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs)
+    scheduler = build_scheduler(optimizer, args.epochs, args.warmup_epochs, len(train_loader))
     use_amp   = device.type == "cuda"
     scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
     ckpt_root = Path(args.checkpoint_dir) / args.run_name
     start_epoch, global_step, best_val_acc = load_checkpoint_if_available(
         model, optimizer, scheduler, scaler, ckpt_root, args.resume_from)
+
+    # Only the main process writes checkpoints; ranks stay in lockstep otherwise.
+    def save_cb(ep, step):
+        if utils.is_main_process():
+            save_checkpoint(model, optimizer, scheduler, scaler,
+                            ep, step, best_val_acc, ckpt_root, epoch_completed=False)
 
     try:
         for epoch in range(start_epoch, args.epochs):
@@ -579,7 +649,9 @@ def train_ddp(args):
 
             loss_sum, correct_sum, total_sum, global_step = train_one_epoch(
                 model, train_loader, optimizer, device, epoch, args.log_every,
-                run, global_step, scaler, use_amp, args.run_name, return_sums=True)
+                run, global_step, scaler, use_amp, args.run_name, return_sums=True,
+                save_cb=save_cb, ckpt_every=args.ckpt_every_steps,
+                scheduler=scheduler, grad_clip=args.grad_clip)
             loss_sum, correct_sum, total_sum = reduce_epoch_stats(
                 loss_sum, correct_sum, total_sum, device)
             epoch_loss = loss_sum    / max(total_sum, 1)
@@ -592,7 +664,7 @@ def train_ddp(args):
             val_epoch_loss = val_loss_sum    / max(val_total_sum, 1)
             val_epoch_acc  = val_correct_sum / max(val_total_sum, 1)
 
-            scheduler.step()
+            # scheduler steps per-iteration inside train_one_epoch (warmup + cosine)
 
             if utils.is_main_process():
                 print(
@@ -632,7 +704,13 @@ def parse_args():
     parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--epochs",          type=int,   default=40)
     parser.add_argument("--lr",              type=float, default=0.1,
-                        help="Base LR (per-process); scaled by linear rule at runtime.")
+                        help="Base LR (per-process); scaled by linear rule at runtime "
+                             "unless --peak-lr is set.")
+    parser.add_argument("--peak-lr",         type=float, default=0.0,
+                        help="Fixed peak LR; overrides the linear-scaling rule when > 0. "
+                             "Preferred for fine-tuning (e.g. 0.05).")
+    parser.add_argument("--grad-clip",       type=float, default=1.0,
+                        help="Max grad norm (clip_grad_norm_, after unscale). 0 disables.")
     parser.add_argument("--weight-decay",    type=float, default=1e-4)
     parser.add_argument("--momentum",        type=float, default=0.9)
     parser.add_argument("--warmup-epochs",   type=int,   default=0,
@@ -649,6 +727,9 @@ def parse_args():
     parser.add_argument("--checkpoint-dir",  default="checkpoints")
     parser.add_argument("--resume-from",     type=str,   default=None,
                         help="Checkpoint path or 'latest'.")
+    parser.add_argument("--ckpt-every-steps", type=int,  default=0,
+                        help="Save a full-state checkpoint every N global steps "
+                             "(mid-epoch). 0 = epoch-boundary saves only.")
     parser.add_argument("--ddp",             action="store_true")
     return parser.parse_args()
 
