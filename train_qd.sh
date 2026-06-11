@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=lf_vanilla_rn50            # Job name
-#SBATCH --output=outputs/lf_vanilla_rn50_%j.log  # Standard output log (%j = job ID)
-#SBATCH --error=outputs/lf_vanilla_rn50_%j.err   # Standard error log
+#SBATCH --job-name=lf_qd_rn50                 # Job name
+#SBATCH --output=outputs/lf_qd_rn50_%j.log    # Standard output log (%j = job ID)
+#SBATCH --error=outputs/lf_qd_rn50_%j.err     # Standard error log
 #SBATCH --time=2-00:00:00                     # Time limit (dd-hh:mm:ss)
 #SBATCH --ntasks=2                            # Number of tasks (typically 1 for single-node jobs)
 #SBATCH --cpus-per-task=8                     # Number of CPUs per task
@@ -12,6 +12,9 @@
 #SBATCH --requeue                            # auto-requeue on node failure/preemption
 #SBATCH --open-mode=append                   # append logs across requeues
 # =============================================================
+# Identical hyperparameters to train.sh (vanilla), EXCEPT the sketch encoder is
+# initialized from the QuickDraw-pretrained ResNet50 (checkpoints/r50-sgd/best.pth,
+# val acc 0.8507) via --sketch_encoder_pt. This is the QD-encoder comparison variant.
 echo "job: $SLURM_JOB_NAME"
 # >>> Conda setup <<<
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -40,7 +43,7 @@ echo "nproc_per_node: $SLURM_GPUS_ON_NODE"
 echo "master port: $MASTER_PORT"
 
 # Auto-resume: pass --resume only if a checkpoint already exists (safe on first run + requeue)
-OUT_DIR="$PROJECT_HOME/outputs/lf_vanilla_rn50"
+OUT_DIR="$PROJECT_HOME/outputs/lf_qd_rn50"
 mkdir -p "$OUT_DIR"
 RESUME_ARG=""
 if [ -f "$OUT_DIR/checkpoint.pth" ]; then
@@ -75,4 +78,6 @@ python -u -m torch.distributed.run \
     --lr_drop 40 \
     `# single x0.1 drop at epoch 40 (~80% of 50); honored via multistep -> milestones=[lr_drop]` \
     --warmup-epochs 0 \
+    --sketch_encoder_pt "$PROJECT_HOME/checkpoints/r50-sgd/best.pth" \
+    `# QD-pretrained ResNet50 sketch encoder (val acc 0.8507) — the only difference vs train.sh` \
     $RESUME_ARG

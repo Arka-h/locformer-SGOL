@@ -21,7 +21,9 @@ from datasets import  get_coco_api_from_dataset
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    n_iter_to_acc: int = 1, print_freq: int = 100):
+                    n_iter_to_acc: int = 1, print_freq: int = 100,
+                    global_step: int = 0, wandb_run=None,
+                    ckpt_every: int = 0, save_cb=None):
     """
     Training one epoch
 
@@ -95,23 +97,39 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # lr_scheduler.step()
 
         batch_idx += 1
+        global_step += 1
 
         # save logs per iteration
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
+        # per-step wandb logging keyed on global_step
+        if wandb_run is not None and global_step % print_freq == 0:
+            wandb_run.log({
+                'train/loss':        loss_value,
+                'train/class_error': loss_dict_reduced['class_error'].item(),
+                'train/lr':          optimizer.param_groups[0]["lr"],
+                'train/epoch':       epoch,
+                'train/global_step': global_step,
+            })
+
+        # mid-epoch checkpoint (save_cb encapsulates the main-process guard)
+        if save_cb is not None and ckpt_every and global_step % ckpt_every == 0:
+            save_cb(epoch, global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, global_step
 
 
 def train_one_epoch_with_teacher(model: torch.nn.Module, teacher_model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    n_iter_to_acc: int = 1, print_freq: int = 100):
+                    n_iter_to_acc: int = 1, print_freq: int = 100,
+                    global_step: int = 0, wandb_run=None,
+                    ckpt_every: int = 0, save_cb=None):
     """
     Training one epoch
 
@@ -193,11 +211,26 @@ def train_one_epoch_with_teacher(model: torch.nn.Module, teacher_model: torch.nn
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         batch_idx += 1
+        global_step += 1
+
+        # per-step wandb logging keyed on global_step
+        if wandb_run is not None and global_step % print_freq == 0:
+            wandb_run.log({
+                'train/loss':        loss_value,
+                'train/class_error': loss_dict_reduced['class_error'].item(),
+                'train/lr':          optimizer.param_groups[0]["lr"],
+                'train/epoch':       epoch,
+                'train/global_step': global_step,
+            })
+
+        # mid-epoch checkpoint (save_cb encapsulates the main-process guard)
+        if save_cb is not None and ckpt_every and global_step % ckpt_every == 0:
+            save_cb(epoch, global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, global_step
 
 def inverse_normalize(tensor, mean, std):
     for t, m, s in zip(tensor, mean, std):

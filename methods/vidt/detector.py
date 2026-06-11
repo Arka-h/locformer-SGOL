@@ -206,7 +206,7 @@ class Detector(nn.Module):
                  # The three techniques were not used in ViDT paper.
                  # After submitting our paper, we saw the ViDT performance could be further enhanced with them.
                  cross_scale_fusion=None, iou_aware=False, token_label=False,
-                 distil=False, has_sketch_emb_pt=False):
+                 distil=False, has_sketch_emb_pt=False, sketch_emb_pt_path=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -303,15 +303,19 @@ class Detector(nn.Module):
                                     )
         self.sketch_embedding = torchvision.models.resnet50(pretrained=True)
         if has_sketch_emb_pt:
-            state_dict = torch.load("/path/to/sketch-encoder/best_model.pt") # TODO: What's here?
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[13:] # remove `module.`
-                new_state_dict[name] = v
-            del new_state_dict['fc.weight']
-            del new_state_dict['fc.bias']
-        
-            self.sketch_embedding.load_state_dict(new_state_dict, strict=False)
+            # Load a QuickDraw-pretrained ResNet50 (from resnet_pretrainer.save_best_checkpoint:
+            # weights live under "model_state", no "module." prefix, 331-class fc which we drop
+            # since fc/avgpool become Identity below). strict=False tolerates the dropped keys.
+            ckpt = torch.load(sketch_emb_pt_path, map_location="cpu")
+            state = ckpt.get("model_state", ckpt.get("model", ckpt))
+            new_state_dict = OrderedDict(
+                (k[len("module."):] if k.startswith("module.") else k, v)
+                for k, v in state.items())
+            new_state_dict.pop('fc.weight', None)
+            new_state_dict.pop('fc.bias', None)
+            missing, unexpected = self.sketch_embedding.load_state_dict(new_state_dict, strict=False)
+            print(f"[sketch_encoder] loaded QD weights from {sketch_emb_pt_path} "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
 
   
         self.gp_norm = nn.GroupNorm(32, 2048)
@@ -611,6 +615,9 @@ def build(args, is_teacher=False):
         token_label=args.token_label,
         # distil
         distil=False if args.distil_model is None else True,
+        # sketch encoder: QD-pretrained if a checkpoint path is given, else vanilla ImageNet
+        has_sketch_emb_pt=bool(getattr(args, 'sketch_encoder_pt', '')),
+        sketch_emb_pt_path=getattr(args, 'sketch_encoder_pt', '') or None,
     )
 
     matcher = build_matcher(args)

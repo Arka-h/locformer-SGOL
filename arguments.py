@@ -88,6 +88,9 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', default=False, type=lambda x: (str(x).lower() == 'true'), help='eval mode')
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--ckpt_every_steps', default=0, type=int,
+                        help='save a full-state checkpoint every N global steps '
+                             '(mid-epoch). 0 = epoch-boundary saves only.')
 
     # * Training setup
     parser.add_argument('--dist-url', default='tcp://127.0.0.1:3457', type=str,
@@ -118,9 +121,12 @@ def get_args_parser():
     parser.add_argument('--dec_n_points', default=4, type=int) # 4 before
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--cls_loss_coef', default=2, type=float)
-    parser.add_argument('--focal_alpha', default=0.0, type=float) #0.25 before
+    parser.add_argument('--focal_alpha', default=0.25, type=float)  # standard DETR; matches matcher's hardcoded 0.25
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
+    parser.add_argument('--sketch_encoder_pt', default='', type=str,
+                        help="Path to a QD-pretrained ResNet50 checkpoint for the sketch encoder. "
+                             "Empty = vanilla ImageNet weights.")
     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
 
 

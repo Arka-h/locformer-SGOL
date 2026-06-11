@@ -70,6 +70,9 @@ def setup_wandb(args, run_name=None):
     wandb.define_metric("test_*",  step_metric="epoch")
     wandb.define_metric("lr/*",    step_metric="epoch")
     wandb.define_metric("time/*",  step_metric="epoch")
+    # per-step training curves keyed on global step
+    wandb.define_metric("train/global_step")
+    wandb.define_metric("train/*", step_metric="train/global_step")
 
     # optional (can be heavy):
     # wandb.watch(model, log="gradients", log_freq=200)
@@ -151,31 +154,46 @@ def main(args):
         print('number of params for teacher:', n_parameters)
 
     # optimizer setup
+    def match_name_keywords(name, name_keywords):
+        return any(kw in name for kw in name_keywords)
+
     def build_optimizer(model, args):
+        # Standard Deformable-DETR / ViDT param grouping (4 groups):
+        #   head        : non-backbone, non-linear-proj (decoder heads, sketch encoder, fusion) -> args.lr (1e-4)
+        #   backbone_*  : Swin backbone, fine-tuned at args.lr_backbone (1e-5, 10x lower); norms/biases get wd=0
+        #   linear_proj : deformable sampling_offsets / reference_points -> args.lr * args.lr_linear_proj_mult (1e-5)
+        # Previously the backbone ran at args.lr and there was NO linear_proj group (both args were dead).
         skip = model.backbone.no_weight_decay() if hasattr(model.backbone, 'no_weight_decay') else set()
+        proj_kw = args.lr_linear_proj_names
         head = []
         backbone_decay = []
         backbone_no_decay = []
+        linear_proj = []
         for name, param in model.named_parameters():
-            # print(name)
-            if "backbone" not in name and param.requires_grad:
-                # print(name)
-                head.append(param)
-            if "backbone" in name and param.requires_grad:
+            if not param.requires_grad:
+                continue
+            if "backbone" in name:
                 if len(param.shape) == 1 or name.endswith(".bias") or name.split('.')[-1] in skip:
                     backbone_no_decay.append(param)
                 else:
                     backbone_decay.append(param)
+            elif match_name_keywords(name, proj_kw):
+                linear_proj.append(param)
+            else:
+                head.append(param)
         param_dicts = [
-            {"params": head},
-            {"params": backbone_no_decay, "weight_decay": 0., "lr": args.lr},
-            {"params": backbone_decay, "lr": args.lr},
+            {"params": head, "lr": args.lr},
+            {"params": backbone_decay, "lr": args.lr_backbone},
+            {"params": backbone_no_decay, "lr": args.lr_backbone, "weight_decay": 0.},
+            {"params": linear_proj, "lr": args.lr * args.lr_linear_proj_mult},
         ]
-
 
         # print the total number of trainable params.
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print('num of total trainable prams:' + str(n_parameters))
+        print(f'[optimizer] groups: head={len(head)} @ {args.lr:g} | '
+              f'backbone={len(backbone_decay)+len(backbone_no_decay)} @ {args.lr_backbone:g} | '
+              f'linear_proj={len(linear_proj)} @ {args.lr * args.lr_linear_proj_mult:g}')
 
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
         return optimizer
@@ -217,6 +235,7 @@ def main(args):
     output_dir = Path(args.output_dir)
 
     # resume from a checkpoint or eval with a checkpoint
+    global_step = 0
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -227,7 +246,14 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
+            # Mid-epoch saves (epoch_completed=False) resume at the same epoch —
+            # the per-epoch lr_scheduler.step(epoch) has not yet run for it.
+            # End-of-epoch saves (or legacy ckpts without the flag) resume next.
+            if checkpoint.get('epoch_completed', True):
+                args.start_epoch = checkpoint['epoch'] + 1
+            else:
+                args.start_epoch = checkpoint['epoch']
+            global_step = checkpoint.get('global_step', 0)
         print('load a checkpoint from', args.resume)
 
     # only evaluation purpose
@@ -242,6 +268,27 @@ def main(args):
     print("Start training")
     start_time = time.time()
 
+    def save_ckpt(path, epoch, global_step, epoch_completed):
+        """Atomic, main-process-only full-state save (temp file + rename)."""
+        if not utils.is_main_process():
+            return
+        path = Path(path)
+        tmp = path.with_suffix('.pth.tmp')
+        utils.save_on_master({
+            'model': model_without_ddp.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'epoch': epoch,
+            'epoch_completed': epoch_completed,
+            'global_step': global_step,
+            'args': args,
+        }, tmp)
+        tmp.replace(path)
+
+    # mid-epoch save target: the rolling checkpoint.pth (epoch_completed=False)
+    def save_cb(ep, step):
+        save_ckpt(output_dir / 'checkpoint.pth', ep, step, epoch_completed=False)
+
     if not args.resume:
         args.start_epoch = 0
     for epoch in range(args.start_epoch, args.epochs):
@@ -252,31 +299,28 @@ def main(args):
 
         if teacher_model is None:
             # training one epoch with default setting
-            train_stats = train_one_epoch(
+            train_stats, global_step = train_one_epoch(
                 model, criterion, data_loader_train, optimizer, device, epoch,
-                args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq)
+                args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq,
+                global_step=global_step, wandb_run=wandb_run,
+                ckpt_every=(args.ckpt_every_steps if args.output_dir else 0), save_cb=save_cb)
         else:
             # training one epoch with distillation with token matching
-            train_stats = train_one_epoch_with_teacher(
+            train_stats, global_step = train_one_epoch_with_teacher(
                 model, teacher_model, criterion, data_loader_train, optimizer, device, epoch,
-                args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq)
-        
+                args.clip_max_norm, n_iter_to_acc=args.n_iter_to_acc, print_freq=args.print_freq,
+                global_step=global_step, wandb_run=wandb_run,
+                ckpt_every=(args.ckpt_every_steps if args.output_dir else 0), save_cb=save_cb)
+
         lr_scheduler.step(epoch)
 
-        # model save
+        # model save (end of epoch -> epoch_completed=True)
         if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
+            save_ckpt(output_dir / 'checkpoint.pth', epoch, global_step, epoch_completed=True)
             # extra checkpoint before LR drop and every 100 epochs
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+                save_ckpt(output_dir / f'checkpoint{epoch:04}.pth', epoch, global_step,
+                          epoch_completed=True)
 
         # evaluation on COCO val.
         test_stats, coco_evaluator = evaluate(
@@ -294,7 +338,9 @@ def main(args):
                 "lr/backbone_no_decay": optimizer.param_groups[1]["lr"],
                 "lr/backbone_decay": optimizer.param_groups[2]["lr"],
             }
-            wandb.log({**log_stats, **lr_dict}, step=epoch)
+            # No explicit step= : epoch is the step_metric for train_*/test_*/lr/*,
+            # and mixing explicit steps with the per-step logs would be dropped by wandb.
+            wandb.log({**log_stats, **lr_dict})
 
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:

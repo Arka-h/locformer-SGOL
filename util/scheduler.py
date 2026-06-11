@@ -252,5 +252,8 @@ def create_scheduler(args, optimizer, num_steps):
             # num_cycles = 1
         )
     elif args.sched == 'multistep':
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[0,3], gamma=0.1)
+        # Single (or multiple) ×decay_rate drop(s) at --lr_drop epoch(s), honoring the CLI.
+        # (Previously hardcoded milestones=[0,3], gamma=0.1 — collapsed the LR by epoch 3.)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=[args.lr_drop], gamma=args.decay_rate)
     return lr_scheduler, num_epochs
