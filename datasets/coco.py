@@ -138,10 +138,20 @@ class QuickDrawIndex:
     def has_class(self, class_name: str) -> bool:
         return class_name in self._mmap_cache
 
-    def sample_pil(self, class_name: str, k: int = 5) -> list:
-        """Return k rasterised PIL images sampled randomly from `class_name`."""
+    def sample_pil(self, class_name: str, k: int = 5, rng=None) -> list:
+        """Return k rasterised PIL images sampled from `class_name`.
+
+        rng=None  -> stochastic (np.random), used for training.
+        rng=random.Random(...) -> deterministic per-image draw, used for the
+        canonical eval protocol (fresh Random(14) per image, never sharing the
+        category-pick stream).
+        """
         ptr, strokes = self._mmap_cache[class_name]
-        indices = np.random.choice(self.class2indices[class_name], size=k, replace=True)
+        pool = self.class2indices[class_name]
+        if rng is None:
+            indices = np.random.choice(pool, size=k, replace=True)
+        else:
+            indices = [int(pool[rng.randrange(len(pool))]) for _ in range(k)]
         return [rasterize_stroke3(strokes[ptr[i]: ptr[i + 1]]) for i in indices]
 
 
@@ -204,10 +214,27 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
             self.id2class[cat['id']] = cat['name']
             self.class2id[cat['name']] = cat['id']
 
+        # Strict open-world exclusion: during OPEN-world *training*, drop any
+        # image that contains even a single held-out (unseen) instance — the
+        # whole image, not just its annotations — so no held-out pixels leak
+        # into training. Mirrors clip_ddetr's "drop any train image with a
+        # held-out category" rule. (val keeps unseen images as-is; closed-world
+        # has no held-out set.)
+        excl_set = (set(self.UNSEEN_CATEGORIES)
+                    if (train_scheme == 'open' and image_set == 'train')
+                    else set())
+        excluded_image_ids = set()
+        if excl_set:
+            for anno in json_file['annotations']:
+                if self.id2class[anno['category_id']] in excl_set:
+                    excluded_image_ids.add(anno['image_id'])
+
         # Filter annotations to the visible category subset for this split
         visible_set = set(self.visible_categories)
         annotate, selected_image_ids = [], []
         for anno in json_file['annotations']:
+            if anno['image_id'] in excluded_image_ids:
+                continue
             if self.id2class[anno['category_id']] in visible_set:
                 annotate.append(anno)
                 selected_image_ids.append(anno['image_id'])
@@ -215,6 +242,10 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         selected_image_ids = set(selected_image_ids)
         images = [img for img in json_file['images']
                   if img['id'] in selected_image_ids]
+        if excl_set:
+            print(f'[CocoDetectionQD] strict OW exclusion: dropped '
+                  f'{len(excluded_image_ids)} train images containing held-out '
+                  f'categories; {len(images)} images remain')
 
         json_file['annotations'] = annotate
         json_file['images'] = images
@@ -238,24 +269,46 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         print(f'[CocoDetectionQD] Loading QuickDraw mmap index ({split}) from {qd_root} ...')
         self.qd_index = QuickDrawIndex(qd_root, self.visible_categories, split=split)
 
+        # ---- Canonical deterministic eval protocol (mirrors clip_ddetr) ----
+        # For val/test, fix the query category per image with a FRESH
+        # random.Random(14) over the SORTED list of eligible categories present
+        # in that image (not a global seed reset + set-hash order). The GT is
+        # built from this same map in build_eval_gt() (not by walking
+        # __getitem__), so the logged mAP is reproducible run-to-run. Sketches
+        # are drawn at __getitem__ from a SEPARATE fresh random.Random(14)
+        # stream per image, never sharing this category-pick stream.
+        self._seed14_cat_map = {}
+        if image_set != 'train':
+            for img_id in self.ids:
+                cats = sorted({a['category_id']
+                               for a in self.coco.imgToAnns.get(img_id, [])
+                               if a.get('iscrowd', 0) == 0
+                               and a['bbox'][2] > 0 and a['bbox'][3] > 0})
+                if cats:
+                    self._seed14_cat_map[img_id] = random.Random(14).choice(cats)
+
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
-
-        # Fix random seed for reproducible val sketches
-        if self.image_set != 'train':
-            random.seed(14)
-        else:
-            random.seed(int(1000 * time.time()) & 0xFFFFFFFF)
 
         image_id = self.ids[idx]
         target   = {'image_id': image_id, 'annotations': target}
         img, target = self.prepare(img, target)
 
-        # Pick a random category present in this image as the query
         categories = list(set(target['labels'].tolist()))
         if not categories:
             return self.__getitem__(random.randint(0, len(self) - 1))
-        selected_cat = random.choice(categories)
+
+        if self.image_set != 'train':
+            # Deterministic query category from the seed-14 map; sketches from a
+            # separate fresh Random(14) stream (canonical reproducible eval).
+            selected_cat = self._seed14_cat_map.get(image_id)
+            if selected_cat is None or selected_cat not in categories:
+                selected_cat = random.Random(14).choice(sorted(categories))
+            sketch_rng = random.Random(14)
+        else:
+            # Stochastic query category + sketches during training.
+            selected_cat = random.choice(categories)
+            sketch_rng = None
 
         # Keep only annotations for the selected category
         keep = target['labels'] == selected_cat
@@ -269,7 +322,8 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
 
         # Sample QuickDraw sketches for the query category via mmap
         if self.qd_index.has_class(selected_cat_name):
-            pil_sketches = self.qd_index.sample_pil(selected_cat_name, k=self.num_sketches)
+            pil_sketches = self.qd_index.sample_pil(
+                selected_cat_name, k=self.num_sketches, rng=sketch_rng)
         else:
             # Fallback: blank white sketches if class is missing from the index
             pil_sketches = [Image.new('RGB', (224, 224), (255, 255, 255))] * self.num_sketches
@@ -286,6 +340,44 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
             new_target['boxes']     = old_boxes
 
         return img, new_target, sketch_list
+
+    def build_eval_gt(self):
+        """Canonical eval GT, built from JSON (NOT by walking __getitem__).
+
+        One box-set per image: the boxes of the seed-14-selected query
+        category, collapsed to category_id=1 to match the detector's
+        foreground label (num_classes=2 -> PostProcess label = topk % 2, so
+        foreground predictions carry label 1). Box coords are the original
+        COCO pixel xywh; predictions are rescaled to orig_size at eval, so the
+        two are directly comparable. Deterministic -> reproducible mAP.
+        """
+        from pycocotools.coco import COCO as _COCO
+        gt = {'images': [], 'categories': [{'id': 1, 'name': 'object'}],
+              'annotations': []}
+        ann_id = 1
+        for img_id in self.ids:
+            sel = self._seed14_cat_map.get(img_id)
+            if sel is None:
+                continue
+            anns = [a for a in self.coco.imgToAnns.get(img_id, [])
+                    if a['category_id'] == sel and a.get('iscrowd', 0) == 0
+                    and a['bbox'][2] > 0 and a['bbox'][3] > 0]
+            if not anns:
+                continue
+            info = self.coco.loadImgs(img_id)[0]
+            gt['images'].append({'id': img_id,
+                                 'height': info['height'],
+                                 'width': info['width']})
+            for a in anns:
+                gt['annotations'].append({
+                    'id': ann_id, 'image_id': img_id, 'category_id': 1,
+                    'bbox': a['bbox'], 'area': a['area'], 'iscrowd': 0,
+                })
+                ann_id += 1
+        coco_gt = _COCO()
+        coco_gt.dataset = gt
+        coco_gt.createIndex()
+        return coco_gt
 
 
 # ---------------------------------------------------------------------------

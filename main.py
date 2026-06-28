@@ -119,6 +119,15 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
+    # Canonical eval protocol (Rule 1): force deterministic cudnn BEFORE the
+    # model is built so a standalone --eval gives bit-reproducible mAP. We do
+    # not enable this during training (it disables cudnn autotuning and hurts
+    # throughput); per-epoch eval reproducibility is already guaranteed at the
+    # data level (seed-14 query category + sketches + JSON-built GT).
+    if args.eval:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     # import pdb;pdb.set_trace()
     model, criterion, postprocessors = build_model(args)
     model.to(device)

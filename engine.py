@@ -265,8 +265,14 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device):
 
     # return eval. metrics
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    base_ds = get_coco_api_from_dataset(data_loader.dataset)
-  
+    # Canonical deterministic GT (seed-14 query category per image, built from
+    # JSON) when the dataset supports it; otherwise fall back to the legacy GT
+    # assembled by walking __getitem__.
+    eval_ds = data_loader.dataset
+    if hasattr(eval_ds, 'build_eval_gt'):
+        base_ds = eval_ds.build_eval_gt()
+    else:
+        base_ds = get_coco_api_from_dataset(eval_ds)
 
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
 
