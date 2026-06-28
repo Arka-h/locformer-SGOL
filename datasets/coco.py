@@ -167,19 +167,24 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
     Returns: (image_tensor, target_dict, sketch_tensor)
         sketch_tensor: float32 [k, 3, 224, 224], normalised
     """
-    # UNSEEN_CATS follows Locformer's i%4==0 of their category ordering, not clip_ddetr's. 
-    # !Do not change to match clip_ddetr without also re-pretraining
-    # Categories visible during training (matches original subset)
+    # Category ordering copied VERBATIM from the OW reproduction repo
+    # (clip_ddetr_ow_repr/dataset_creation.py: self.all_categories). The i%4==0
+    # base-holdout is POSITIONAL, so this exact order is what reproduces the
+    # thesis held-out set (set-B): backpack, bicycle, clock, couch, dog,
+    # elephant, knife, mouse, oven, pizza, sandwich, skateboard, stop sign,
+    # train. (The earlier LocFormer-native order yielded a DIFFERENT 14 cats.)
+    # NOTE: this split must match resnet_pretrainer.UNSEEN_CATS — the sketch
+    # encoder must be (re)pretrained excluding exactly these 14 categories.
     ALL_CATEGORIES = [
-        'elephant', 'bear', 'cat', 'zebra', 'bus', 'horse', 'giraffe',
-        'airplane', 'bed', 'dog', 'scissors', 'train', 'sandwich', 'pizza',
-        'cow', 'broccoli', 'umbrella', 'sheep', 'bird', 'stop sign',
-        'toothbrush', 'bicycle', 'hot dog', 'laptop', 'toaster', 'microwave',
-        'banana', 'baseball bat', 'donut', 'couch', 'keyboard', 'cake',
-        'oven', 'carrot', 'bench', 'suitcase', 'fire hydrant', 'fork',
-        'chair', 'wine glass', 'apple', 'truck', 'cell phone', 'cup', 'car',
-        'knife', 'toilet', 'clock', 'backpack', 'spoon', 'vase', 'book',
-        'skateboard', 'sink', 'mouse', 'traffic light',
+        'bicycle', 'car', 'airplane', 'bus', 'train', 'truck', 'traffic light',
+        'fire hydrant', 'stop sign', 'bench', 'bird', 'cat', 'dog', 'horse',
+        'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+        'umbrella', 'suitcase', 'baseball bat', 'skateboard', 'wine glass',
+        'cup', 'fork', 'knife', 'spoon', 'banana', 'apple', 'sandwich',
+        'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+        'couch', 'bed', 'toilet', 'laptop', 'mouse', 'keyboard', 'cell phone',
+        'microwave', 'oven', 'toaster', 'sink', 'book', 'clock', 'vase',
+        'scissors', 'toothbrush',
     ]
 
     # Open-world split: hold out every 4th category (i%4==0) of the LocFormer

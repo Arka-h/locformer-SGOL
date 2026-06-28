@@ -26,10 +26,14 @@ QD_ROOT      = Path(os.environ["QD_DATASET"])
 PROJECT_HOME = Path(os.environ["PROJECT_HOME"])
 WANDB_MODE   = os.environ.get("WANDB_MODE", "disabled")
 
+# Held-out (unseen) set for the OW thesis reproduction (set-B): i%4==0 of the
+# clip_ddetr_ow_repr category ordering. MUST match
+# datasets/coco.py:CocoDetectionQD.ALL_CATEGORIES holdout. The sketch encoder
+# is pretrained EXCLUDING exactly these 14 categories so none leak into the
+# encoder before open-world detection eval.
 UNSEEN_CATS = {
-    "elephant", "bus", "bed", "sandwich", "umbrella", "toothbrush",
-    "toaster", "donut", "oven", "fire hydrant", "apple", "car",
-    "backpack", "skateboard",
+    "backpack", "bicycle", "clock", "couch", "dog", "elephant", "knife",
+    "mouse", "oven", "pizza", "sandwich", "skateboard", "stop sign", "train",
 }
 
 CHECKPOINT_FILENAME      = "latest.pth"
