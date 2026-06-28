@@ -75,6 +75,14 @@ def get_args_parser():
     parser.add_argument('--qd_root', default='', type=str,
                         help='path to SLIP-style QuickDraw npy files '
                              '({class}.{split}.ptr.npy + {class}.{split}.strokes.npy)')
+    parser.add_argument('--num_sketches', default=5, type=int,
+                        help='number of sketch queries per category '
+                             '(use 1 for the one-shot open-world setting)')
+    parser.add_argument('--train_scheme_world', default='closed', type=str,
+                        choices=['open', 'closed'],
+                        help="'open': hold out i%%4==0 categories — train on the "
+                             "42 seen cats, eval on the 14 unseen cats. "
+                             "'closed': all categories visible in both splits.")
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 

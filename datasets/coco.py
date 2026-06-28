@@ -172,11 +172,31 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         'skateboard', 'sink', 'mouse', 'traffic light',
     ]
 
+    # Open-world split: hold out every 4th category (i%4==0) of the LocFormer
+    # ordering above as the *unseen* test set; the remaining 42 are *seen*.
+    # This index-based rule (not clip_ddetr's name list) is what the pretrained
+    # sketch encoder expects — see the note above ALL_CATEGORIES.
+    UNSEEN_CATEGORIES = [c for i, c in enumerate(ALL_CATEGORIES) if i % 4 == 0]
+    SEEN_CATEGORIES   = [c for i, c in enumerate(ALL_CATEGORIES) if i % 4 != 0]
+
     def __init__(self, image_set, img_folder, ann_file, root, qd_root,
-                 transforms, return_masks, num_sketches=5):
+                 transforms, return_masks, num_sketches=5,
+                 train_scheme='closed'):
         json_file = json.load(open(ann_file))
         self.coco_home = Path(root)
         ROOT = self.coco_home / 'annotations'
+
+        # Decide which categories are visible in this split.
+        #   closed-world : all 56 categories in both train and val (default).
+        #   open-world   : 42 seen cats during training, 14 unseen cats at eval.
+        if train_scheme == 'open':
+            visible_categories = (self.SEEN_CATEGORIES if image_set == 'train'
+                                  else self.UNSEEN_CATEGORIES)
+        else:
+            visible_categories = self.ALL_CATEGORIES
+        self.visible_categories = list(visible_categories)
+        print(f'[CocoDetectionQD] scheme={train_scheme} image_set={image_set} '
+              f'-> {len(self.visible_categories)} visible categories')
 
         self.id2class = {}
         self.class2id = {}
@@ -184,10 +204,11 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
             self.id2class[cat['id']] = cat['name']
             self.class2id[cat['name']] = cat['id']
 
-        # Filter annotations to the supported category subset
+        # Filter annotations to the visible category subset for this split
+        visible_set = set(self.visible_categories)
         annotate, selected_image_ids = [], []
         for anno in json_file['annotations']:
-            if self.id2class[anno['category_id']] in self.ALL_CATEGORIES:
+            if self.id2class[anno['category_id']] in visible_set:
                 annotate.append(anno)
                 selected_image_ids.append(anno['image_id'])
 
@@ -215,7 +236,7 @@ class CocoDetectionQD(torchvision.datasets.CocoDetection):
         # SLIP-style mmap index
         split = 'train' if image_set == 'train' else 'valid'
         print(f'[CocoDetectionQD] Loading QuickDraw mmap index ({split}) from {qd_root} ...')
-        self.qd_index = QuickDrawIndex(qd_root, self.ALL_CATEGORIES, split=split)
+        self.qd_index = QuickDrawIndex(qd_root, self.visible_categories, split=split)
 
     def __getitem__(self, idx):
         img, target = super().__getitem__(idx)
@@ -503,4 +524,6 @@ def build(image_set, args):
         qd_root=args.qd_root,
         transforms=make_coco_transforms(image_set, args),
         return_masks=True,
+        num_sketches=getattr(args, 'num_sketches', 5),
+        train_scheme=getattr(args, 'train_scheme_world', 'closed'),
     )
