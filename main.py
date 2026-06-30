@@ -25,6 +25,7 @@ from util.scheduler import create_scheduler
 from arguments import get_args_parser
 import argparse
 import wandb
+from util.wandb_health import log_run_provenance, wandb_save_checkpoints
 
 def _wandb_safe_config(args):
     cfg = {}
@@ -111,6 +112,7 @@ def main(args):
         run_name = os.path.basename(args.output_dir) if args.output_dir else None
         wandb_run = setup_wandb(args, run_name=run_name)
         wandb.config.update({"git_sha": utils.get_sha()}, allow_val_change=True)
+        log_run_provenance(wandb_run, repo_dir=os.path.dirname(os.path.abspath(__file__)))
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -330,6 +332,10 @@ def main(args):
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
                 save_ckpt(output_dir / f'checkpoint{epoch:04}.pth', epoch, global_step,
                           epoch_completed=True)
+            # upload the rolling checkpoint to wandb (overwrites each epoch; bounded storage).
+            # locformer only saves checkpoint.pth (no best_AP.pth tracking), so restrict to it.
+            if utils.is_main_process():
+                wandb_save_checkpoints(wandb_run, args.output_dir, names=('checkpoint.pth',))
 
         # evaluation on COCO val.
         test_stats, coco_evaluator = evaluate(

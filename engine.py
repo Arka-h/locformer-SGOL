@@ -13,8 +13,26 @@ from typing import Iterable
 import torch
 
 import util.misc as utils
+from util.wandb_health import log_grad_health
 from datasets.coco_eval import CocoEvaluator
 from datasets import  get_coco_api_from_dataset
+
+# ViDT / Swin-tiny param-name -> component bucket (for per-component grad-health bars).
+# Prefixes match the real top-level module names in methods/vidt/detector.py:
+#   self.backbone (Swin w/ det_token, det_pos_embed), self.transformer (deformable,
+#   incl. cross_attn / encoder / decoder), self.fusion (FPN cross-scale), the sketch
+#   stack (sketch_embedding/sketch_proj/sketch_proj_query/sketch_query_pos), self.input_proj,
+#   the det heads (class_embed_v2 / bbox_embed / iou_embed), and the query/tgt projections.
+LF_GROUPS = {
+    'backbone_swin': ('backbone',),
+    'sketch_encoder': ('sketch_embedding', 'sketch_proj', 'sketch_proj_query',
+                       'sketch_query_pos', 'gp_norm'),
+    'transformer': ('transformer',),
+    'det_token': ('det_token', 'det_pos_embed', 'tgt_proj', 'query_pos_proj',
+                  'query_fusion', 'pos_proj', 'trans', 'row_embed', 'col_embed'),
+    'heads': ('class_embed_v2', 'bbox_embed', 'iou_embed'),
+    'fusion': ('fusion', 'input_proj'),
+}
 
 
 
@@ -88,6 +106,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # backprop.
         losses /= float(n_iter_to_acc)
         losses.backward()
+        if utils.is_main_process() and wandb_run is not None and global_step % 100 == 0:
+            log_grad_health(model, global_step, wandb_run, groups=LF_GROUPS)
         if (batch_idx + 1) % n_iter_to_acc == 0:
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
