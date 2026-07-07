@@ -127,8 +127,21 @@ def main(args):
     # throughput); per-epoch eval reproducibility is already guaranteed at the
     # data level (seed-14 query category + sketches + JSON-built GT).
     if args.eval:
+        # Match the CASF analysis-branch determinism standard exactly
+        # (scripts/_determinism.py) so LocFormer's mAP is on the same ruler and
+        # bit-reproducible across processes: cudnn.deterministic + benchmark=False
+        # PLUS use_deterministic_algorithms + CUBLAS_WORKSPACE_CONFIG. The env var
+        # must be set before the first cuBLAS handle is created (i.e. before
+        # build_model below); also export it in the launch command as a backstop.
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception as e:  # older torch
+            print(f"[determinism] use_deterministic_algorithms unavailable: {e}")
+        print("[determinism] cudnn.deterministic=True benchmark=False "
+              "use_deterministic_algorithms=True CUBLAS_WORKSPACE_CONFIG=:4096:8")
 
     # import pdb;pdb.set_trace()
     model, criterion, postprocessors = build_model(args)
